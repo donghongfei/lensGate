@@ -24,6 +24,8 @@ export interface StreamState {
   nextToolCallIndex: number;
   textDeltaSeen: Set<number>;
   emittedAnyOutput: boolean;
+  accumulatedText: string;
+  streamFinishReason: string | null;
 }
 
 function asTextContent(content: string | OpenAIContentPart[] | null, allowImages: boolean): string {
@@ -260,7 +262,9 @@ export function createStreamState(modelId: string): StreamState {
     toolCallIndexMap: new Map<number, number>(),
     nextToolCallIndex: 0,
     textDeltaSeen: new Set<number>(),
-    emittedAnyOutput: false
+    emittedAnyOutput: false,
+    accumulatedText: "",
+    streamFinishReason: null
   };
 }
 
@@ -284,6 +288,7 @@ export function eventToSSEChunks(event: unknown, state: StreamState): string[] {
     if (deltaText.length > 0) {
       state.textDeltaSeen.add(contentIndex);
       state.emittedAnyOutput = true;
+      state.accumulatedText += deltaText;
       chunks.push(formatSSEDataLine(toChunk(state, { content: deltaText }, null)));
     }
     return chunks;
@@ -295,6 +300,7 @@ export function eventToSSEChunks(event: unknown, state: StreamState): string[] {
     // Some providers send full text only in text_end; emit it when no prior delta was emitted.
     if (text.length > 0 && !state.textDeltaSeen.has(contentIndex)) {
       state.emittedAnyOutput = true;
+      state.accumulatedText += text;
       chunks.push(formatSSEDataLine(toChunk(state, { content: text }, null)));
     }
     return chunks;
@@ -379,6 +385,7 @@ export function eventToSSEChunks(event: unknown, state: StreamState): string[] {
 
   if (eventType === "done") {
     const finishReason = mapStopReason(record.reason ?? record.stopReason);
+    state.streamFinishReason = finishReason;
     chunks.push(formatSSEDataLine(toChunk(state, {}, finishReason)));
     return chunks;
   }

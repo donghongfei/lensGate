@@ -26,3 +26,15 @@ export const LOG_LEVEL = process.env.LOG_LEVEL ?? "info";
  * 不设置则不校验，任何请求都放行。
  */
 export const PROXY_API_KEY = process.env.PROXY_API_KEY ?? "";
+
+/** Langfuse 公钥（不设置则不上报） */
+export const LANGFUSE_PUBLIC_KEY = process.env.LANGFUSE_PUBLIC_KEY ?? "";
+
+/** Langfuse 密钥 */
+export const LANGFUSE_SECRET_KEY = process.env.LANGFUSE_SECRET_KEY ?? "";
+
+/**
+ * Langfuse 服务地址（自建实例时修改）
+ * 默认 https://cloud.langfuse.com
+ */
+export const LANGFUSE_HOST = process.env.LANGFUSE_HOST ?? "";

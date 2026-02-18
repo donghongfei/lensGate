@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { streamSimple } from "@mariozechner/pi-ai";
 import { getAccessToken, NotLoggedInError } from "./auth.js";
 import { BODY_LIMIT_BYTES, CORS_ALLOW_ORIGIN, LOG_LEVEL, PROXY_API_KEY } from "./config.js";
+import { endGeneration, startGeneration } from "./observe.js";
 import {
   assistantMessageToResponse,
   createStreamState,
@@ -265,7 +266,7 @@ async function writeSSEStream(
   streamLike: unknown,
   modelId: string,
   requestId: string
-): Promise<{ emittedAnyOutput: boolean }> {
+): Promise<{ emittedAnyOutput: boolean; accumulatedText: string; streamFinishReason: string | null }> {
   response.statusCode = 200;
   setCorsHeaders(response);
   response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -306,7 +307,7 @@ async function writeSSEStream(
     }
   }
 
-  return { emittedAnyOutput: state.emittedAnyOutput };
+  return { emittedAnyOutput: state.emittedAnyOutput, accumulatedText: state.accumulatedText, streamFinishReason: state.streamFinishReason };
 }
 
 function toOpenAIModelObject(model: unknown): OpenAIModelObject {
@@ -555,10 +556,24 @@ async function handleChatCompletions(
     stream: body.stream === true
   });
 
+  const generation = startGeneration({
+    traceId: requestId,
+    model: body.model,
+    messages: body.messages,
+    temperature: body.temperature,
+    maxTokens: body.max_tokens,
+    topP: body.top_p,
+    startedAt
+  });
+
   const eventStream = streamSimple(model as never, context as never, streamOptions as never);
 
   if (body.stream === true) {
     const streamOutcome = await writeSSEStream(response, eventStream, requestedModelId, requestId);
+    endGeneration(generation, {
+      text: streamOutcome.accumulatedText,
+      finishReason: streamOutcome.streamFinishReason ?? undefined
+    });
     writeLog("info", "chat.request.complete", {
       request_id: requestId,
       model: requestedModelId,
@@ -584,6 +599,13 @@ async function handleChatCompletions(
 
   const responseBody = assistantMessageToResponse(assistantMessage, requestedModelId, generateCompletionId());
   sendJson(response, 200, responseBody);
+  endGeneration(generation, {
+    message: responseBody.choices[0]?.message,
+    promptTokens: responseBody.usage.prompt_tokens,
+    completionTokens: responseBody.usage.completion_tokens,
+    totalTokens: responseBody.usage.total_tokens,
+    finishReason: responseBody.choices[0]?.finish_reason ?? undefined
+  });
   writeLog("info", "chat.request.complete", {
     request_id: requestId,
     model: requestedModelId,

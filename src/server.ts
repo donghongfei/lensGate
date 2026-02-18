@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { HOST, PORT } from "./config.js";
 import { handleRequest } from "./handler.js";
+import { flushLangfuse } from "./observe.js";
 
 const port = PORT;
 const host = HOST;
@@ -18,7 +19,7 @@ server.listen(port, host, () => {
 function shutdown(signal: string): void {
   process.stdout.write(`\nReceived ${signal}, shutting down...\n`);
   server.close(() => {
-    process.exit(0);
+    flushLangfuse().finally(() => process.exit(0));
   });
 }
 
