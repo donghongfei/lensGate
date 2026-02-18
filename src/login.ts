@@ -3,6 +3,7 @@ import { exec } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline";
 import { AuthStorage } from "@mariozechner/pi-coding-agent";
+import { AUTH_STORAGE_PATH } from "./config.js";
 
 type AnyAuthStorage = {
   hasAuth?: (...args: unknown[]) => boolean;
@@ -62,13 +63,12 @@ function stringifyProgress(event: unknown): string {
 }
 
 async function main(): Promise<void> {
-  const authStorage = AuthStorage.create() as unknown as AnyAuthStorage;
+  const authStorage = AuthStorage.create(AUTH_STORAGE_PATH) as unknown as AnyAuthStorage;
   const rl = createInterface({ input, output });
 
   try {
     const alreadyLoggedIn = Boolean(
-      (typeof authStorage.hasAuth === "function" && authStorage.hasAuth("openai-codex")) ||
-        (typeof authStorage.hasAuth === "function" && authStorage.hasAuth())
+      typeof authStorage.hasAuth === "function" && authStorage.hasAuth("openai-codex")
     );
 
     if (alreadyLoggedIn) {

@@ -6,8 +6,8 @@
   "packageManager": "pnpm@10.18.3",
   "scripts": {
     "build": "tsc -p tsconfig.build.json && shx chmod +x dist/server.js dist/login.js",
-    "login": "node dist/login.js",
-    "start": "node dist/server.js"
+    "login": "node --env-file-if-exists=.env dist/login.js",
+    "start": "node --env-file-if-exists=.env dist/server.js"
   },
   "dependencies": {
     "@mariozechner/pi-ai": "^0.53.0",

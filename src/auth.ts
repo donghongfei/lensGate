@@ -1,11 +1,12 @@
 import { AuthStorage } from "@mariozechner/pi-coding-agent";
+import { AUTH_STORAGE_PATH } from "./config.js";
 
 type AnyAuthStorage = {
   hasAuth?: (...args: unknown[]) => boolean;
   getApiKey?: (...args: unknown[]) => Promise<unknown> | unknown;
 };
 
-const authStorage = AuthStorage.create() as unknown as AnyAuthStorage;
+const authStorage = AuthStorage.create(AUTH_STORAGE_PATH) as unknown as AnyAuthStorage;
 
 export class NotLoggedInError extends Error {
   constructor(message = "No OAuth credentials found. Run `pnpm run login` first.") {
@@ -39,7 +40,7 @@ export function hasCredentials(): boolean {
       return false;
     }
 
-    return Boolean(authStorage.hasAuth("openai-codex") || authStorage.hasAuth());
+    return Boolean(authStorage.hasAuth("openai-codex"));
   } catch {
     return false;
   }

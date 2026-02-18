@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import { streamSimple } from "@mariozechner/pi-ai";
 import { getAccessToken, NotLoggedInError } from "./auth.js";
+import { BODY_LIMIT_BYTES, CORS_ALLOW_ORIGIN, LOG_LEVEL, PROXY_API_KEY } from "./config.js";
 import {
   assistantMessageToResponse,
   createStreamState,
@@ -13,9 +14,6 @@ import {
 import { getAllCodexModels, modelIdFromUnknown, resolveCodexModel, UnknownModelError } from "./models.js";
 import type { OpenAIChatRequest, OpenAIErrorResponse, OpenAIModelObject, OpenAIModelsResponse } from "./types.js";
 
-const BODY_LIMIT_BYTES = Number(process.env.BODY_LIMIT_BYTES ?? 1024 * 1024);
-const CORS_ALLOW_ORIGIN = process.env.CORS_ALLOW_ORIGIN ?? "*";
-
 type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
@@ -25,7 +23,7 @@ const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
   error: 40
 };
 
-const CURRENT_LOG_LEVEL: LogLevel = normalizeLogLevel(process.env.LOG_LEVEL);
+const CURRENT_LOG_LEVEL: LogLevel = normalizeLogLevel(LOG_LEVEL);
 
 class PayloadTooLargeError extends Error {
   constructor(message = "Request body is too large.") {
@@ -278,9 +276,17 @@ async function writeSSEStream(
 
   const state = createStreamState(modelId);
   let closed = false;
+  let clientDisconnected = false;
+
+  response.on("close", () => {
+    clientDisconnected = true;
+  });
 
   try {
     for await (const event of asAsyncIterable(streamLike)) {
+      if (clientDisconnected) {
+        break;
+      }
       const chunks = eventToSSEChunks(event, state);
       for (const chunk of chunks) {
         response.write(chunk);
@@ -481,7 +487,7 @@ function handleRequestError(response: ServerResponse, error: unknown, requestId:
 }
 
 function validateApiKeyHeader(request: IncomingMessage): void {
-  const expectedApiKey = process.env.PROXY_API_KEY;
+  const expectedApiKey = PROXY_API_KEY || undefined;
   if (!expectedApiKey) {
     return;
   }

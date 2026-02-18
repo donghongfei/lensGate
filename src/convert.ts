@@ -348,15 +348,7 @@ export function eventToSSEChunks(event: unknown, state: StreamState): string[] {
     if (argumentsDelta.length > 0) {
       const delta: Partial<OpenAIMessage> = {
         tool_calls: [
-          {
-            id: readString(record, "id", "toolCallId") || `call_${openAiToolCallIndex}`,
-            type: "function",
-            function: {
-              name: readString(record, "name", "toolName") || "tool",
-              arguments: argumentsDelta
-            },
-            index: openAiToolCallIndex
-          }
+          { index: openAiToolCallIndex, function: { arguments: argumentsDelta } } as OpenAIToolCall
         ]
       };
       state.emittedAnyOutput = true;
