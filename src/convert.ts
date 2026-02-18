@@ -159,9 +159,8 @@ export function openAIRequestToContext(req: OpenAIChatRequest): Record<string, u
     }
   }
 
-  if (systemPrompts.length > 0) {
-    context.systemPrompt = systemPrompts.join("\n\n");
-  }
+  // Codex API 要求 instructions 字段必须存在，没有 system message 时传空字符串
+  context.systemPrompt = systemPrompts.join("\n\n");
 
   if (Array.isArray(req.tools) && req.tools.length > 0) {
     context.tools = req.tools.map((tool) => messageToTool(tool));
