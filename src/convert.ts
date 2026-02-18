@@ -22,6 +22,8 @@ export interface StreamState {
   created: number;
   toolCallIndexMap: Map<number, number>;
   nextToolCallIndex: number;
+  textDeltaSeen: Set<number>;
+  emittedAnyOutput: boolean;
 }
 
 function asTextContent(content: string | OpenAIContentPart[] | null, allowImages: boolean): string {
@@ -177,13 +179,18 @@ function formatSSEDataLine(payload: unknown): string {
 }
 
 function mapStopReason(stopReason: unknown): "stop" | "length" | "tool_calls" | "content_filter" {
-  if (stopReason === "tool_calls" || stopReason === "tool_call") {
+  if (
+    stopReason === "tool_calls" ||
+    stopReason === "tool_call" ||
+    stopReason === "toolUse" ||
+    stopReason === "tool_use"
+  ) {
     return "tool_calls";
   }
   if (stopReason === "max_tokens" || stopReason === "length") {
     return "length";
   }
-  if (stopReason === "content_filter") {
+  if (stopReason === "content_filter" || stopReason === "error" || stopReason === "aborted") {
     return "content_filter";
   }
   return "stop";
@@ -252,7 +259,9 @@ export function createStreamState(modelId: string): StreamState {
     model: modelId,
     created: Math.floor(Date.now() / 1000),
     toolCallIndexMap: new Map<number, number>(),
-    nextToolCallIndex: 0
+    nextToolCallIndex: 0,
+    textDeltaSeen: new Set<number>(),
+    emittedAnyOutput: false
   };
 }
 
@@ -272,8 +281,22 @@ export function eventToSSEChunks(event: unknown, state: StreamState): string[] {
 
   if (eventType === "text_delta") {
     const deltaText = readString(record, "delta", "text", "content");
+    const contentIndex = readNumber(record, "contentIndex", "index") ?? 0;
     if (deltaText.length > 0) {
+      state.textDeltaSeen.add(contentIndex);
+      state.emittedAnyOutput = true;
       chunks.push(formatSSEDataLine(toChunk(state, { content: deltaText }, null)));
+    }
+    return chunks;
+  }
+
+  if (eventType === "text_end") {
+    const contentIndex = readNumber(record, "contentIndex", "index") ?? 0;
+    const text = readString(record, "content", "text", "delta");
+    // Some providers send full text only in text_end; emit it when no prior delta was emitted.
+    if (text.length > 0 && !state.textDeltaSeen.has(contentIndex)) {
+      state.emittedAnyOutput = true;
+      chunks.push(formatSSEDataLine(toChunk(state, { content: text }, null)));
     }
     return chunks;
   }
@@ -304,6 +327,7 @@ export function eventToSSEChunks(event: unknown, state: StreamState): string[] {
       ]
     };
 
+    state.emittedAnyOutput = true;
     chunks.push(formatSSEDataLine(toChunk(state, delta, null)));
     return chunks;
   }
@@ -335,13 +359,35 @@ export function eventToSSEChunks(event: unknown, state: StreamState): string[] {
           }
         ]
       };
+      state.emittedAnyOutput = true;
       chunks.push(formatSSEDataLine(toChunk(state, delta, null)));
     }
     return chunks;
   }
 
+  if (eventType === "error") {
+    const errorRecord =
+      record.error && typeof record.error === "object" ? (record.error as Record<string, unknown>) : undefined;
+    const message =
+      readString(record, "errorMessage", "message") ||
+      (errorRecord && readString(errorRecord, "errorMessage", "message")) ||
+      "Upstream model error.";
+
+    chunks.push(
+      formatSSEDataLine({
+        error: {
+          message,
+          type: "server_error",
+          param: null,
+          code: "upstream_model_error"
+        }
+      })
+    );
+    return chunks;
+  }
+
   if (eventType === "done") {
-    const finishReason = mapStopReason(record.stopReason);
+    const finishReason = mapStopReason(record.reason ?? record.stopReason);
     chunks.push(formatSSEDataLine(toChunk(state, {}, finishReason)));
     return chunks;
   }
@@ -466,7 +512,7 @@ export function assistantMessageToResponse(
       {
         index: 0,
         message: responseMessage,
-        finish_reason: toolCalls.length > 0 ? "tool_calls" : mapStopReason(record.stopReason)
+        finish_reason: toolCalls.length > 0 ? "tool_calls" : mapStopReason(record.stopReason ?? record.reason)
       }
     ],
     usage: {

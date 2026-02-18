@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { randomBytes } from "node:crypto";
 import { streamSimple } from "@mariozechner/pi-ai";
 import { getAccessToken, NotLoggedInError } from "./auth.js";
 import {
@@ -9,11 +10,22 @@ import {
   ImageNotSupportedError,
   openAIRequestToContext
 } from "./convert.js";
-import { getAllCodexModels, modelIdFromUnknown, resolveCodexModel, resolveRequestedModelId } from "./models.js";
+import { getAllCodexModels, modelIdFromUnknown, resolveCodexModel, UnknownModelError } from "./models.js";
 import type { OpenAIChatRequest, OpenAIErrorResponse, OpenAIModelObject, OpenAIModelsResponse } from "./types.js";
 
 const BODY_LIMIT_BYTES = Number(process.env.BODY_LIMIT_BYTES ?? 1024 * 1024);
 const CORS_ALLOW_ORIGIN = process.env.CORS_ALLOW_ORIGIN ?? "*";
+
+type LogLevel = "debug" | "info" | "warn" | "error";
+
+const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40
+};
+
+const CURRENT_LOG_LEVEL: LogLevel = normalizeLogLevel(process.env.LOG_LEVEL);
 
 class PayloadTooLargeError extends Error {
   constructor(message = "Request body is too large.") {
@@ -37,6 +49,62 @@ class InvalidJSONError extends Error {
     super(message);
     this.name = "InvalidJSONError";
   }
+}
+
+class UpstreamModelError extends Error {
+  code: string | null;
+
+  constructor(message: string, code: string | null = "upstream_model_error") {
+    super(message);
+    this.name = "UpstreamModelError";
+    this.code = code;
+  }
+}
+
+function normalizeLogLevel(value: string | undefined): LogLevel {
+  if (value === "debug" || value === "info" || value === "warn" || value === "error") {
+    return value;
+  }
+  return "info";
+}
+
+function shouldLog(level: LogLevel): boolean {
+  return LOG_LEVEL_PRIORITY[level] >= LOG_LEVEL_PRIORITY[CURRENT_LOG_LEVEL];
+}
+
+function writeLog(level: LogLevel, event: string, fields: Record<string, unknown>): void {
+  if (!shouldLog(level)) {
+    return;
+  }
+
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    event,
+    ...fields
+  };
+  const line = `${JSON.stringify(payload)}\n`;
+  if (level === "error") {
+    process.stderr.write(line);
+    return;
+  }
+  process.stdout.write(line);
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function getRequestId(request: IncomingMessage): string {
+  const headerValue = request.headers["x-request-id"];
+  const candidate = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+  if (typeof candidate === "string") {
+    const trimmed = candidate.trim();
+    if (trimmed.length > 0 && trimmed.length <= 128) {
+      return trimmed;
+    }
+  }
+  return `req_${randomBytes(8).toString("hex")}`;
 }
 
 function setCorsHeaders(response: ServerResponse): void {
@@ -68,6 +136,26 @@ function sendOpenAIError(
     }
   };
   sendJson(response, statusCode, body);
+}
+
+function logAndSendOpenAIError(
+  response: ServerResponse,
+  requestId: string,
+  statusCode: number,
+  message: string,
+  type: string,
+  code: string | null,
+  level: "warn" | "error",
+  event: string
+): void {
+  writeLog(level, event, {
+    request_id: requestId,
+    status_code: statusCode,
+    error_type: type,
+    error_code: code,
+    message
+  });
+  sendOpenAIError(response, statusCode, message, type, code);
 }
 
 async function readRequestBody(request: IncomingMessage): Promise<string> {
@@ -174,7 +262,12 @@ async function getFinalAssistantMessage(streamLike: unknown): Promise<unknown> {
   return finalMessage;
 }
 
-async function writeSSEStream(response: ServerResponse, streamLike: unknown, modelId: string): Promise<void> {
+async function writeSSEStream(
+  response: ServerResponse,
+  streamLike: unknown,
+  modelId: string,
+  requestId: string
+): Promise<{ emittedAnyOutput: boolean }> {
   response.statusCode = 200;
   setCorsHeaders(response);
   response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -193,8 +286,12 @@ async function writeSSEStream(response: ServerResponse, streamLike: unknown, mod
         response.write(chunk);
       }
     }
-  } catch {
-    // Streaming response may already be partially written; finish with [DONE].
+  } catch (error) {
+    writeLog("warn", "chat.stream.iteration_error", {
+      request_id: requestId,
+      model: modelId,
+      message: getErrorMessage(error)
+    });
   } finally {
     if (!closed && !response.writableEnded) {
       response.write("data: [DONE]\n\n");
@@ -202,6 +299,8 @@ async function writeSSEStream(response: ServerResponse, streamLike: unknown, mod
       closed = true;
     }
   }
+
+  return { emittedAnyOutput: state.emittedAnyOutput };
 }
 
 function toOpenAIModelObject(model: unknown): OpenAIModelObject {
@@ -224,39 +323,161 @@ function isRateLimitError(error: unknown): boolean {
   return text.includes("rate_limit") || text.includes("usage_limit") || code.includes("rate_limit");
 }
 
-function handleRequestError(response: ServerResponse, error: unknown): void {
+function getAssistantStopReason(message: unknown): string {
+  if (!message || typeof message !== "object") {
+    return "";
+  }
+  const record = message as Record<string, unknown>;
+  const stopReason = record.stopReason ?? record.stop_reason ?? record.reason;
+  return typeof stopReason === "string" ? stopReason : "";
+}
+
+function getAssistantErrorMessage(message: unknown): string {
+  if (!message || typeof message !== "object") {
+    return "";
+  }
+  const record = message as Record<string, unknown>;
+  const value = record.errorMessage ?? record.error_message ?? record.message;
+  return typeof value === "string" ? value : "";
+}
+
+function handleRequestError(response: ServerResponse, error: unknown, requestId: string): void {
   if (error instanceof NotLoggedInError) {
-    sendOpenAIError(response, 401, error.message, "authentication_error", "not_logged_in");
+    logAndSendOpenAIError(
+      response,
+      requestId,
+      401,
+      error.message,
+      "authentication_error",
+      "not_logged_in",
+      "warn",
+      "request.error.auth"
+    );
     return;
   }
 
   if (error instanceof ImageNotSupportedError) {
-    sendOpenAIError(response, 400, error.message, "invalid_request_error", "image_not_supported");
+    logAndSendOpenAIError(
+      response,
+      requestId,
+      400,
+      error.message,
+      "invalid_request_error",
+      "image_not_supported",
+      "warn",
+      "request.error.image_not_supported"
+    );
+    return;
+  }
+
+  if (error instanceof UnknownModelError) {
+    logAndSendOpenAIError(
+      response,
+      requestId,
+      400,
+      error.message,
+      "invalid_request_error",
+      "unknown_model",
+      "warn",
+      "request.error.unknown_model"
+    );
     return;
   }
 
   if (error instanceof InvalidRequestError) {
-    sendOpenAIError(response, 400, error.message, "invalid_request_error", error.code);
+    logAndSendOpenAIError(
+      response,
+      requestId,
+      400,
+      error.message,
+      "invalid_request_error",
+      error.code,
+      "warn",
+      "request.error.invalid_request"
+    );
     return;
   }
 
   if (error instanceof InvalidJSONError) {
-    sendOpenAIError(response, 400, error.message, "invalid_request_error", "invalid_json");
+    logAndSendOpenAIError(
+      response,
+      requestId,
+      400,
+      error.message,
+      "invalid_request_error",
+      "invalid_json",
+      "warn",
+      "request.error.invalid_json"
+    );
     return;
   }
 
   if (error instanceof PayloadTooLargeError) {
-    sendOpenAIError(response, 413, error.message, "invalid_request_error", "payload_too_large");
+    logAndSendOpenAIError(
+      response,
+      requestId,
+      413,
+      error.message,
+      "invalid_request_error",
+      "payload_too_large",
+      "warn",
+      "request.error.payload_too_large"
+    );
+    return;
+  }
+
+  if (error instanceof UpstreamModelError) {
+    if (isRateLimitError(error)) {
+      logAndSendOpenAIError(
+        response,
+        requestId,
+        429,
+        error.message,
+        "rate_limit_error",
+        "rate_limit",
+        "warn",
+        "request.error.upstream_rate_limit"
+      );
+      return;
+    }
+    logAndSendOpenAIError(
+      response,
+      requestId,
+      502,
+      error.message,
+      "server_error",
+      error.code,
+      "warn",
+      "request.error.upstream"
+    );
     return;
   }
 
   if (isRateLimitError(error)) {
-    sendOpenAIError(response, 429, "Rate limit exceeded.", "rate_limit_error", "rate_limit");
+    logAndSendOpenAIError(
+      response,
+      requestId,
+      429,
+      "Rate limit exceeded.",
+      "rate_limit_error",
+      "rate_limit",
+      "warn",
+      "request.error.rate_limit"
+    );
     return;
   }
 
   const message = error instanceof Error ? error.message : "Unknown proxy error.";
-  sendOpenAIError(response, 500, message, "server_error", "proxy_internal_error");
+  logAndSendOpenAIError(
+    response,
+    requestId,
+    500,
+    message,
+    "server_error",
+    "proxy_internal_error",
+    "error",
+    "request.error.internal"
+  );
 }
 
 function validateApiKeyHeader(request: IncomingMessage): void {
@@ -276,20 +497,30 @@ function validateApiKeyHeader(request: IncomingMessage): void {
   }
 }
 
-async function handleModels(response: ServerResponse): Promise<void> {
+async function handleModels(response: ServerResponse, requestId: string): Promise<void> {
   const models: OpenAIModelsResponse = {
     object: "list",
     data: getAllCodexModels().map((model) => toOpenAIModelObject(model))
   };
   sendJson(response, 200, models);
+  writeLog("info", "models.list.success", {
+    request_id: requestId,
+    status_code: 200,
+    model_count: models.data.length
+  });
 }
 
-async function handleChatCompletions(request: IncomingMessage, response: ServerResponse): Promise<void> {
+async function handleChatCompletions(
+  request: IncomingMessage,
+  response: ServerResponse,
+  requestId: string
+): Promise<void> {
+  const startedAt = Date.now();
   validateApiKeyHeader(request);
 
   const body = await parseChatRequest(request);
-  const requestedModelId = resolveRequestedModelId(body.model);
-  const model = resolveCodexModel(body.model);
+  const requestedModelId = body.model;
+  const model = resolveCodexModel(requestedModelId);
   const context = openAIRequestToContext(body);
   const accessToken = await getAccessToken();
 
@@ -302,11 +533,34 @@ async function handleChatCompletions(request: IncomingMessage, response: ServerR
   if (typeof body.max_tokens === "number") {
     streamOptions.maxTokens = body.max_tokens;
   }
+  if (typeof body.top_p === "number") {
+    streamOptions.topP = body.top_p;
+  }
+  if (typeof body.frequency_penalty === "number") {
+    streamOptions.frequencyPenalty = body.frequency_penalty;
+  }
+  if (typeof body.presence_penalty === "number") {
+    streamOptions.presencePenalty = body.presence_penalty;
+  }
+
+  writeLog("info", "chat.request.start", {
+    request_id: requestId,
+    requested_model: body.model,
+    stream: body.stream === true
+  });
 
   const eventStream = streamSimple(model as never, context as never, streamOptions as never);
 
   if (body.stream === true) {
-    await writeSSEStream(response, eventStream, requestedModelId);
+    const streamOutcome = await writeSSEStream(response, eventStream, requestedModelId, requestId);
+    writeLog("info", "chat.request.complete", {
+      request_id: requestId,
+      model: requestedModelId,
+      stream: true,
+      status_code: response.statusCode,
+      duration_ms: Date.now() - startedAt,
+      emitted_output: streamOutcome.emittedAnyOutput
+    });
     return;
   }
 
@@ -315,41 +569,104 @@ async function handleChatCompletions(request: IncomingMessage, response: ServerR
     throw new Error("No final assistant message returned from upstream stream.");
   }
 
+  const stopReason = getAssistantStopReason(assistantMessage);
+  if (stopReason === "error" || stopReason === "aborted") {
+    const message =
+      getAssistantErrorMessage(assistantMessage) || `Upstream request failed with stop reason '${stopReason}'.`;
+    throw new UpstreamModelError(message);
+  }
+
   const responseBody = assistantMessageToResponse(assistantMessage, requestedModelId, generateCompletionId());
   sendJson(response, 200, responseBody);
+  writeLog("info", "chat.request.complete", {
+    request_id: requestId,
+    model: requestedModelId,
+    stream: false,
+    status_code: 200,
+    duration_ms: Date.now() - startedAt,
+    finish_reason: responseBody.choices[0]?.finish_reason ?? null,
+    prompt_tokens: responseBody.usage.prompt_tokens,
+    completion_tokens: responseBody.usage.completion_tokens
+  });
 }
 
 export async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const requestId = getRequestId(request);
+  const startedAt = Date.now();
+  response.setHeader("x-request-id", requestId);
+
+  let method = request.method ?? "GET";
+  let pathname = request.url ?? "/";
+  writeLog("info", "request.start", {
+    request_id: requestId,
+    method,
+    path: pathname
+  });
+
   try {
     const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
-    const pathname = requestUrl.pathname;
-    const method = request.method ?? "GET";
+    pathname = requestUrl.pathname;
+    method = request.method ?? "GET";
 
     if (method === "OPTIONS") {
       response.statusCode = 204;
       setCorsHeaders(response);
       response.end();
+      writeLog("info", "request.complete", {
+        request_id: requestId,
+        method,
+        path: pathname,
+        status_code: 204,
+        duration_ms: Date.now() - startedAt
+      });
       return;
     }
 
     if (method === "GET" && pathname === "/v1/models") {
-      await handleModels(response);
+      await handleModels(response, requestId);
+      writeLog("info", "request.complete", {
+        request_id: requestId,
+        method,
+        path: pathname,
+        status_code: response.statusCode,
+        duration_ms: Date.now() - startedAt
+      });
       return;
     }
 
     if (method === "POST" && pathname === "/v1/chat/completions") {
-      await handleChatCompletions(request, response);
+      await handleChatCompletions(request, response, requestId);
+      writeLog("info", "request.complete", {
+        request_id: requestId,
+        method,
+        path: pathname,
+        status_code: response.statusCode,
+        duration_ms: Date.now() - startedAt
+      });
       return;
     }
 
     sendOpenAIError(response, 404, "Route not found.", "invalid_request_error", "not_found");
+    writeLog("warn", "request.complete.not_found", {
+      request_id: requestId,
+      method,
+      path: pathname,
+      status_code: 404,
+      duration_ms: Date.now() - startedAt
+    });
   } catch (error) {
     if (response.headersSent) {
+      writeLog("warn", "request.error.headers_sent", {
+        request_id: requestId,
+        method,
+        path: pathname,
+        message: getErrorMessage(error)
+      });
       if (!response.writableEnded) {
         response.end();
       }
       return;
     }
-    handleRequestError(response, error);
+    handleRequestError(response, error, requestId);
   }
 }
