@@ -1,0 +1,21 @@
+{
+  "name": "@mariozechner/pi-openai-proxy",
+  "version": "0.53.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.18.3",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && shx chmod +x dist/server.js dist/login.js",
+    "login": "node dist/login.js",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.53.0",
+    "@mariozechner/pi-coding-agent": "^0.53.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "shx": "^0.4.0",
+    "typescript": "^5.9.2"
+  }
+}
