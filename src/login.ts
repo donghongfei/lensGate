@@ -62,6 +62,22 @@ function stringifyProgress(event: unknown): string {
   return "";
 }
 
+/** OAuth callback 端口。pi 库硬编码为 1455，确保登录前它是空闲的。 */
+const OAUTH_CALLBACK_PORT = 1455;
+
+function freePort(port: number): Promise<void> {
+  return new Promise((resolve) => {
+    exec(`lsof -ti :${port}`, (err, stdout) => {
+      const pid = stdout.trim();
+      if (!pid) {
+        resolve();
+        return;
+      }
+      exec(`kill -9 ${pid}`, () => resolve());
+    });
+  });
+}
+
 async function main(): Promise<void> {
   const authStorage = AuthStorage.create(AUTH_STORAGE_PATH) as unknown as AnyAuthStorage;
   const rl = createInterface({ input, output });
@@ -82,6 +98,10 @@ async function main(): Promise<void> {
     if (typeof authStorage.login !== "function") {
       throw new Error("AuthStorage.login() is not available.");
     }
+
+    // 确保 OAuth 回调端口空闲，否则 pi 库会回退到手动粘贴模式
+    // 但 OpenAI 不会在页面显示 code，浏览器会一直转圈
+    await freePort(OAUTH_CALLBACK_PORT);
 
     process.stdout.write("Starting OpenAI Codex OAuth login...\n");
 
