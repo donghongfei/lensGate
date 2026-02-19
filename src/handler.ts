@@ -650,6 +650,10 @@ interface NormalizedToolCall {
   argumentsText: string;
 }
 
+interface CompletedToolExecution extends NormalizedToolCall {
+  output: unknown;
+}
+
 type ObservationWithChildren = Pick<LangfuseSpan, "startObservation">;
 
 function stringifyToolCallArguments(value: unknown): string {
@@ -732,12 +736,118 @@ function parseToolArgumentsForObservation(argumentsText: string): unknown {
   }
 }
 
+function toolMessageContentToObservationOutput(
+  content: OpenAIChatRequest["messages"][number]["content"]
+): unknown {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  const textParts = content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .filter((text) => text.length > 0);
+
+  if (textParts.length > 0) {
+    return textParts.join("\n");
+  }
+
+  return content;
+}
+
+function extractRecentCompletedToolExecutions(messages: OpenAIChatRequest["messages"]): CompletedToolExecution[] {
+  let lastAssistantWithToolCallsIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      lastAssistantWithToolCallsIndex = i;
+      break;
+    }
+  }
+
+  if (lastAssistantWithToolCallsIndex < 0) {
+    return [];
+  }
+
+  const assistantMessage = messages[lastAssistantWithToolCallsIndex];
+  const recentToolCalls =
+    assistantMessage.role === "assistant" && Array.isArray(assistantMessage.tool_calls)
+      ? assistantMessage.tool_calls
+      : [];
+  const toolCallById = new Map<string, NormalizedToolCall>();
+  for (const toolCall of recentToolCalls) {
+    if (!toolCall || typeof toolCall !== "object") {
+      continue;
+    }
+    const toolCallId = normalizeId(toolCall.id, 200);
+    if (!toolCallId) {
+      continue;
+    }
+    toolCallById.set(toolCallId, {
+      id: toolCallId,
+      name: normalizeId(toolCall.function?.name, 200) ?? "tool",
+      argumentsText: typeof toolCall.function?.arguments === "string" ? toolCall.function.arguments : ""
+    });
+  }
+
+  const completedExecutions: CompletedToolExecution[] = [];
+  for (let i = lastAssistantWithToolCallsIndex + 1; i < messages.length; i += 1) {
+    const message = messages[i];
+    if (message.role !== "tool") {
+      continue;
+    }
+    const toolCallId = normalizeId(message.tool_call_id, 200);
+    const matchedCall = toolCallId ? toolCallById.get(toolCallId) : undefined;
+    const fallbackName = normalizeId(message.name, 200) ?? "tool";
+    const fallbackId = toolCallId ?? `tool_result_${i}`;
+
+    completedExecutions.push({
+      id: fallbackId,
+      name: matchedCall?.name ?? fallbackName,
+      argumentsText: matchedCall?.argumentsText ?? "",
+      output: toolMessageContentToObservationOutput(message.content)
+    });
+  }
+
+  return completedExecutions;
+}
+
+function emitCompletedToolResultObservations(
+  parent: ObservationWithChildren,
+  completedExecutions: CompletedToolExecution[]
+): void {
+  for (const execution of completedExecutions) {
+    const toolObservation = parent.startObservation(
+      `tool.${execution.name}`,
+      {
+        input: parseToolArgumentsForObservation(execution.argumentsText),
+        output: execution.output,
+        metadata: {
+          toolCallId: execution.id,
+          phase: "tool_result_from_history"
+        },
+        statusMessage: "Tool result observed from request history."
+      },
+      { asType: "tool" }
+    );
+    toolObservation.end();
+  }
+}
+
 function emitRequestedToolCallObservations(parent: ObservationWithChildren, toolCalls: NormalizedToolCall[]): void {
   for (const toolCall of toolCalls) {
     const toolObservation = parent.startObservation(
       `tool.${toolCall.name}`,
       {
         input: parseToolArgumentsForObservation(toolCall.argumentsText),
+        output: {
+          status: "requested",
+          detail: "Tool call requested by model; awaiting runtime result."
+        },
         metadata: {
           toolCallId: toolCall.id,
           phase: "model_requested"
@@ -1307,6 +1417,11 @@ async function handleChatCompletions(
         },
         { asType: "generation", startTime: new Date(startedAt) }
       );
+
+      const completedToolExecutions = extractRecentCompletedToolExecutions(body.messages);
+      if (completedToolExecutions.length > 0) {
+        emitCompletedToolResultObservations(rootObservation, completedToolExecutions);
+      }
 
       const eventStream = streamSimple(model as never, context as never, streamOptions as never);
 
