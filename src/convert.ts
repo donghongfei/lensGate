@@ -97,7 +97,6 @@ function messageRoleToPiMessage(message: OpenAIMessage): Record<string, unknown>
     const assistantMessage: Record<string, unknown> = {
       role: "assistant",
       content: [],
-      toolCalls: [],
       timestamp: Date.now(),
       api: "openai-codex-responses",
       provider: "openai",
@@ -114,7 +113,8 @@ function messageRoleToPiMessage(message: OpenAIMessage): Record<string, unknown>
 
     if (Array.isArray(message.tool_calls)) {
       for (const toolCall of message.tool_calls) {
-        (assistantMessage.toolCalls as unknown[]).push({
+        (assistantMessage.content as unknown[]).push({
+          type: "toolCall",
           id: toolCall.id,
           name: toolCall.function.name,
           arguments: parseToolArguments(toolCall.function.arguments)
@@ -261,6 +261,35 @@ function readNumber(record: Record<string, unknown>, ...keys: string[]): number 
   return null;
 }
 
+function readToolCallFromPartial(
+  record: Record<string, unknown>,
+  contentIndex: number
+): { id: string; name: string } | null {
+  const partial = record.partial;
+  if (!partial || typeof partial !== "object") {
+    return null;
+  }
+
+  const content = (partial as Record<string, unknown>).content;
+  if (!Array.isArray(content) || contentIndex < 0 || contentIndex >= content.length) {
+    return null;
+  }
+
+  const item = content[contentIndex];
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  const toolCall = item as Record<string, unknown>;
+  if (toolCall.type !== "toolCall") {
+    return null;
+  }
+
+  return {
+    id: typeof toolCall.id === "string" ? toolCall.id : "",
+    name: typeof toolCall.name === "string" ? toolCall.name : ""
+  };
+}
+
 export function createStreamState(modelId: string): StreamState {
   return {
     completionId: generateCompletionId(),
@@ -324,8 +353,9 @@ export function eventToSSEChunks(event: unknown, state: StreamState): string[] {
       state.nextToolCallIndex += 1;
     }
 
-    const toolCallId = readString(record, "id", "toolCallId") || `call_${openAiToolCallIndex}`;
-    const toolName = readString(record, "name", "toolName") || "tool";
+    const partialToolCall = readToolCallFromPartial(record, contentIndex);
+    const toolCallId = partialToolCall?.id || readString(record, "id", "toolCallId") || `call_${openAiToolCallIndex}`;
+    const toolName = partialToolCall?.name || readString(record, "name", "toolName") || "tool";
 
     const delta: Partial<OpenAIMessage> = {
       tool_calls: [
@@ -354,16 +384,26 @@ export function eventToSSEChunks(event: unknown, state: StreamState): string[] {
       state.toolCallIndexMap.set(contentIndex, openAiToolCallIndex);
       state.nextToolCallIndex += 1;
     }
+    const partialToolCall = readToolCallFromPartial(record, contentIndex);
 
     const argumentsDelta =
       readString(record, "delta", "argumentsDelta", "arguments", "textDelta") ||
       String(record.value ?? "");
 
-    if (argumentsDelta.length > 0) {
+    if (argumentsDelta.length > 0 || partialToolCall) {
+      const toolCallDelta: Record<string, unknown> = {
+        index: openAiToolCallIndex,
+        function: { arguments: argumentsDelta }
+      };
+      if (partialToolCall?.id) {
+        toolCallDelta.id = partialToolCall.id;
+      }
+      if (partialToolCall?.name) {
+        (toolCallDelta.function as Record<string, unknown>).name = partialToolCall.name;
+      }
+
       const delta: Partial<OpenAIMessage> = {
-        tool_calls: [
-          { index: openAiToolCallIndex, function: { arguments: argumentsDelta } } as OpenAIToolCall
-        ]
+        tool_calls: [toolCallDelta as unknown as OpenAIToolCall]
       };
       state.emittedAnyOutput = true;
       chunks.push(formatSSEDataLine(toChunk(state, delta, null)));
@@ -485,10 +525,18 @@ function assistantTextFromMessage(message: Record<string, unknown>): string {
 }
 
 function openAiToolCallsFromMessage(message: Record<string, unknown>): OpenAIToolCall[] {
-  const source =
+  const structuredCalls =
     (Array.isArray(message.toolCalls) ? message.toolCalls : null) ??
     (Array.isArray(message.tool_calls) ? message.tool_calls : null) ??
     [];
+  const contentCalls =
+    Array.isArray(message.content)
+      ? message.content.filter(
+          (item): item is Record<string, unknown> =>
+            Boolean(item) && typeof item === "object" && (item as Record<string, unknown>).type === "toolCall"
+        )
+      : [];
+  const source = structuredCalls.length > 0 ? structuredCalls : contentCalls;
 
   const calls: OpenAIToolCall[] = [];
   for (let i = 0; i < source.length; i += 1) {
