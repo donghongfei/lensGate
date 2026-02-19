@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import { streamSimple } from "@mariozechner/pi-ai";
-import { propagateAttributes, startActiveObservation, startObservation } from "@langfuse/tracing";
+import { createTraceId, propagateAttributes, startActiveObservation, startObservation } from "@langfuse/tracing";
 import { getAccessToken, NotLoggedInError } from "./auth.js";
 import { BODY_LIMIT_BYTES, CORS_ALLOW_ORIGIN, LOG_LEVEL, PROXY_API_KEY } from "./config.js";
 import {
@@ -157,6 +157,93 @@ function getUserId(request: IncomingMessage, body: OpenAIChatRequest): string | 
   );
 }
 
+interface ConversationInfo {
+  sender?: string;
+  messageId?: string;
+}
+
+function textFromMessageContent(content: OpenAIChatRequest["messages"][number]["content"]): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+function parseConversationInfoObject(candidate: unknown): ConversationInfo {
+  if (!candidate || typeof candidate !== "object") {
+    return {};
+  }
+
+  const record = candidate as Record<string, unknown>;
+  const sender = firstValidId(200, record.sender, record.sender_id, record.senderId, record.user_id, record.userId);
+  const messageId = firstValidId(200, record.message_id, record.messageId, record.id);
+  return { sender, messageId };
+}
+
+function extractConversationInfoFromText(text: string): ConversationInfo {
+  const result: ConversationInfo = {};
+  if (!text) {
+    return result;
+  }
+
+  const codeFenceRegex = /```json\s*([\s\S]*?)```/gi;
+  let match: RegExpExecArray | null;
+  while ((match = codeFenceRegex.exec(text)) !== null) {
+    const jsonBlock = match[1];
+    try {
+      const parsed = JSON.parse(jsonBlock);
+      const info = parseConversationInfoObject(parsed);
+      if (info.sender && !result.sender) {
+        result.sender = info.sender;
+      }
+      if (info.messageId && !result.messageId) {
+        result.messageId = info.messageId;
+      }
+      if (result.sender && result.messageId) {
+        return result;
+      }
+    } catch {
+      // ignore invalid json fences
+    }
+  }
+
+  if (!result.sender) {
+    const senderMatch = text.match(/"sender"\s*:\s*"([^"]+)"/);
+    if (senderMatch) {
+      result.sender = normalizeId(senderMatch[1], 200) ?? undefined;
+    }
+  }
+  if (!result.messageId) {
+    const messageIdMatch = text.match(/"message_id"\s*:\s*"([^"]+)"/);
+    if (messageIdMatch) {
+      result.messageId = normalizeId(messageIdMatch[1], 200) ?? undefined;
+    }
+  }
+
+  return result;
+}
+
+function extractConversationInfoFromMessages(messages: OpenAIChatRequest["messages"]): ConversationInfo {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role !== "user") {
+      continue;
+    }
+    const text = textFromMessageContent(message.content);
+    const info = extractConversationInfoFromText(text);
+    if (info.sender || info.messageId) {
+      return info;
+    }
+  }
+  return {};
+}
+
 function getTurnId(request: IncomingMessage, body: OpenAIChatRequest): string | undefined {
   const bodyRecord = body as Record<string, unknown>;
   return firstValidId(
@@ -178,7 +265,7 @@ function getTurnId(request: IncomingMessage, body: OpenAIChatRequest): string | 
 function buildCorrelationHints(
   request: IncomingMessage,
   body: OpenAIChatRequest,
-  derived: { sessionId?: string; userId?: string; turnId?: string }
+  derived: { sessionId?: string; userId?: string; turnId?: string; traceId?: string; conversationInfo?: ConversationInfo }
 ): Record<string, unknown> {
   const bodyRecord = body as Record<string, unknown>;
 
@@ -224,7 +311,12 @@ function buildCorrelationHints(
     derived: {
       session_id: derived.sessionId ?? null,
       user_id: derived.userId ?? null,
-      turn_id: derived.turnId ?? null
+      turn_id: derived.turnId ?? null,
+      trace_id: derived.traceId ?? null,
+      conversation_info: {
+        sender: derived.conversationInfo?.sender ?? null,
+        message_id: derived.conversationInfo?.messageId ?? null
+      }
     }
   };
 }
@@ -739,9 +831,18 @@ async function handleChatCompletions(
   validateApiKeyHeader(request);
 
   const body = await parseChatRequest(request);
-  const sessionId = getSessionId(request, body);
-  const userId = getUserId(request, body);
-  const turnId = getTurnId(request, body);
+  const conversationInfo = extractConversationInfoFromMessages(body.messages);
+  const inferredSessionId = conversationInfo.sender;
+  const inferredTurnId = firstValidId(
+    200,
+    conversationInfo.sender && conversationInfo.messageId ? `${conversationInfo.sender}:${conversationInfo.messageId}` : undefined,
+    conversationInfo.messageId
+  );
+
+  const sessionId = getSessionId(request, body) ?? inferredSessionId;
+  const userId = getUserId(request, body) ?? conversationInfo.sender;
+  const turnId = getTurnId(request, body) ?? inferredTurnId;
+  const traceId = turnId ? await createTraceId(`turn:${turnId}`) : undefined;
   const requestedModelId = body.model;
   const model = resolveCodexModel(requestedModelId);
   const context = openAIRequestToContext(body);
@@ -763,12 +864,13 @@ async function handleChatCompletions(
     stream: body.stream === true,
     session_id: sessionId ?? null,
     user_id: userId ?? null,
-    turn_id: turnId ?? null
+    turn_id: turnId ?? null,
+    trace_id: traceId ?? null
   });
 
   writeLog("info", "chat.request.correlation_hints", {
     request_id: requestId,
-    ...buildCorrelationHints(request, body, { sessionId, userId, turnId })
+    ...buildCorrelationHints(request, body, { sessionId, userId, turnId, traceId, conversationInfo })
   });
 
   writeLog("info", "chat.request.payload", {
@@ -782,15 +884,22 @@ async function handleChatCompletions(
   if (typeof body.max_tokens === "number") modelParameters.max_tokens = body.max_tokens;
   if (typeof body.top_p === "number") modelParameters.top_p = body.top_p;
 
-  await startActiveObservation("chat", async (trace) => {
-    const executeCompletion = async (): Promise<void> => {
-      trace.updateTrace({
-        ...(sessionId ? { sessionId } : {}),
-        ...(userId ? { userId } : {}),
-        input: { messages: body.messages },
-        metadata: { model: body.model, stream: body.stream === true, requestId }
-      });
-      trace.update({ input: { messages: body.messages } });
+  const runChatObservation = async (): Promise<void> => {
+    await startActiveObservation("chat", async (trace) => {
+      const executeCompletion = async (): Promise<void> => {
+        trace.updateTrace({
+          ...(sessionId ? { sessionId } : {}),
+          ...(userId ? { userId } : {}),
+          input: { messages: body.messages },
+          metadata: {
+            model: body.model,
+            stream: body.stream === true,
+            requestId,
+            turnId: turnId ?? null,
+            traceId: traceId ?? null
+          }
+        });
+        trace.update({ input: { messages: body.messages } });
 
       const generation = startObservation(
         "chat_completion",
@@ -878,7 +987,10 @@ async function handleChatCompletions(
         await executeCompletion();
       }
     );
-  });
+    }, traceId ? { parentSpanContext: { traceId, spanId: randomBytes(8).toString("hex"), traceFlags: 1 } } : undefined);
+  };
+
+  await runChatObservation();
 }
 
 export async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
