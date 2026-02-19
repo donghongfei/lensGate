@@ -875,7 +875,7 @@ function emitCompletedToolResultObservations(
 ): void {
   for (const execution of completedExecutions) {
     const toolObservation = parent.startObservation(
-      `tool.${execution.name}`,
+      `tool_result.${execution.name}`,
       {
         input: parseToolArgumentsForObservation(execution.argumentsText),
         output: execution.output,
@@ -1500,6 +1500,11 @@ async function handleChatCompletions(
       });
       rootObservation.update({ input: { messages: body.messages } });
 
+      const completedToolExecutions = extractRecentCompletedToolExecutions(body.messages);
+      if (completedToolExecutions.length > 0) {
+        emitCompletedToolResultObservations(rootObservation, completedToolExecutions);
+      }
+
       const generation = startObservation(
         "chat_completion",
         {
@@ -1507,13 +1512,8 @@ async function handleChatCompletions(
           input: { messages: body.messages },
           modelParameters
         },
-        { asType: "generation", startTime: new Date(startedAt) }
+        { asType: "generation" }
       );
-
-      const completedToolExecutions = extractRecentCompletedToolExecutions(body.messages);
-      if (completedToolExecutions.length > 0) {
-        emitCompletedToolResultObservations(rootObservation, completedToolExecutions);
-      }
 
       const eventStream = streamSimple(model as never, context as never, streamOptions as never);
 
@@ -1655,23 +1655,16 @@ async function handleChatCompletions(
     );
   };
 
-  const startContext = parentSpanContext ? { parentSpanContext } : undefined;
+  const startTime = new Date(startedAt);
+  const startContext = parentSpanContext ? { parentSpanContext, startTime } : { startTime };
 
   try {
     if (toolContext.isAgentic) {
-      if (startContext) {
-        await startActiveObservation("chat.turn.agent", runWithRootObservation, { ...startContext, asType: "agent" });
-        return;
-      }
-      await startActiveObservation("chat.turn.agent", runWithRootObservation, { asType: "agent" });
+      await startActiveObservation("chat.turn.agent", runWithRootObservation, { ...startContext, asType: "agent" });
       return;
     }
 
-    if (startContext) {
-      await startActiveObservation("chat.turn", runWithRootObservation, startContext);
-      return;
-    }
-    await startActiveObservation("chat.turn", runWithRootObservation);
+    await startActiveObservation("chat.turn", runWithRootObservation, startContext);
   } finally {
     request.off("aborted", abortUpstream);
     response.off("close", abortUpstream);
