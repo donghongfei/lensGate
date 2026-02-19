@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { BlockList, isIP } from "node:net";
 import type {
   OpenAIChatChunk,
   OpenAIChatRequest,
@@ -13,6 +14,18 @@ import type {
 const SYSTEM_FINGERPRINT = "fp_lensgate";
 const MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 20_000;
+const PRIVATE_ADDRESS_BLOCKLIST = new BlockList();
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("0.0.0.0", 8, "ipv4");
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("10.0.0.0", 8, "ipv4");
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("100.64.0.0", 10, "ipv4");
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("127.0.0.0", 8, "ipv4");
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("169.254.0.0", 16, "ipv4");
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("172.16.0.0", 12, "ipv4");
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("192.168.0.0", 16, "ipv4");
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("::", 128, "ipv6");
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("::1", 128, "ipv6");
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("fc00::", 7, "ipv6");
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet("fe80::", 10, "ipv6");
 
 export class ImageNotSupportedError extends Error {
   constructor(message = "image_url content is not supported by this proxy.") {
@@ -70,6 +83,31 @@ function inferMimeTypeFromUrl(url: URL): string | null {
   if (pathname.endsWith(".heic")) return "image/heic";
   if (pathname.endsWith(".heif")) return "image/heif";
   return null;
+}
+
+function isBlockedImageHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase().replace(/\.$/, "");
+  if (!normalized) {
+    return true;
+  }
+  if (normalized === "localhost" || normalized.endsWith(".localhost")) {
+    return true;
+  }
+
+  const ipVersion = isIP(normalized);
+  if (ipVersion === 4) {
+    return PRIVATE_ADDRESS_BLOCKLIST.check(normalized, "ipv4");
+  }
+  if (ipVersion === 6) {
+    if (normalized.startsWith("::ffff:")) {
+      const mapped = normalized.slice("::ffff:".length);
+      if (isIP(mapped) === 4 && PRIVATE_ADDRESS_BLOCKLIST.check(mapped, "ipv4")) {
+        return true;
+      }
+    }
+    return PRIVATE_ADDRESS_BLOCKLIST.check(normalized, "ipv6");
+  }
+  return false;
 }
 
 function parseDataUrl(dataUrl: string): { mimeType: string; data: string } {
@@ -192,6 +230,9 @@ async function toPiImageContent(urlValue: string): Promise<{ type: "image"; data
 
   if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
     throw new ImageNotSupportedError("Only http(s) and data URI image_url values are supported.");
+  }
+  if (isBlockedImageHostname(parsedUrl.hostname)) {
+    throw new ImageNotSupportedError("image_url host is not allowed.");
   }
 
   const remote = await fetchRemoteImageAsBase64(parsedUrl);

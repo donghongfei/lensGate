@@ -62,20 +62,36 @@ function stringifyProgress(event: unknown): string {
   return "";
 }
 
-/** OAuth callback 端口。pi 库硬编码为 1455，确保登录前它是空闲的。 */
+/** OAuth callback 端口。pi 库硬编码为 1455。 */
 const OAUTH_CALLBACK_PORT = 1455;
 
-function freePort(port: number): Promise<void> {
+function findPortOwnerPid(port: number): Promise<string | null> {
   return new Promise((resolve) => {
-    exec(`lsof -ti :${port}`, (err, stdout) => {
-      const pid = stdout.trim();
-      if (!pid) {
-        resolve();
+    exec(`lsof -ti :${port}`, (error, stdout) => {
+      if (error) {
+        resolve(null);
         return;
       }
-      exec(`kill -9 ${pid}`, () => resolve());
+      const pid = stdout.trim();
+      resolve(pid.length > 0 ? pid : null);
     });
   });
+}
+
+async function ensureCallbackPortAvailability(rl: ReturnType<typeof createInterface>): Promise<void> {
+  const pid = await findPortOwnerPid(OAUTH_CALLBACK_PORT);
+  if (!pid) {
+    return;
+  }
+
+  process.stdout.write(
+    `Warning: OAuth callback port ${OAUTH_CALLBACK_PORT} is occupied by PID ${pid}.\n` +
+      "OpenAI callback may fail and require manual fallback.\n"
+  );
+  const answer = (await ask(rl, "Continue login anyway? [y/N] ")).trim().toLowerCase();
+  if (answer !== "y" && answer !== "yes") {
+    throw new Error(`OAuth login aborted: callback port ${OAUTH_CALLBACK_PORT} is in use.`);
+  }
 }
 
 async function main(): Promise<void> {
@@ -99,9 +115,8 @@ async function main(): Promise<void> {
       throw new Error("AuthStorage.login() is not available.");
     }
 
-    // 确保 OAuth 回调端口空闲，否则 pi 库会回退到手动粘贴模式
-    // 但 OpenAI 不会在页面显示 code，浏览器会一直转圈
-    await freePort(OAUTH_CALLBACK_PORT);
+    // 回调端口被占用时，尊重现有进程，交由用户决定是否继续。
+    await ensureCallbackPortAvailability(rl);
 
     process.stdout.write("Starting OpenAI Codex OAuth login...\n");
 

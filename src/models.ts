@@ -44,11 +44,11 @@ export function resolveCodexModel(requested: string | undefined): unknown {
     throw new UnknownModelError("");
   }
 
-  try {
-    return getModel(CODEX_PROVIDER, requestedModelId as never);
-  } catch {
+  const resolvedModel = getModel(CODEX_PROVIDER, requestedModelId as never);
+  if (!resolvedModel) {
     throw new UnknownModelError(requestedModelId);
   }
+  return resolvedModel;
 }
 
 export function modelIdFromUnknown(model: unknown): string {

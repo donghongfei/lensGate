@@ -1256,7 +1256,7 @@ function handleRequestError(response: ServerResponse, error: unknown, requestId:
       400,
       error.message,
       "invalid_request_error",
-      "model_not_found",
+      "unknown_model",
       "warn",
       "request.error.unknown_model"
     );
@@ -1403,8 +1403,8 @@ async function handleChatCompletions(
   const toolContext = summarizeToolContext(body);
   const requestedModelId = body.model;
   const model = resolveCodexModel(requestedModelId);
-  const context = await openAIRequestToContext(body);
   const accessToken = await getAccessToken();
+  const context = await openAIRequestToContext(body);
   const bodyRecord = body as Record<string, unknown>;
   const maxCompletionTokensCandidate =
     typeof bodyRecord.max_completion_tokens === "number"
