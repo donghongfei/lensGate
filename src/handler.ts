@@ -199,7 +199,8 @@ const OPENAI_PAYLOAD_PASSTHROUGH_RULES: PayloadPassthroughRule[] = [
   { bodyKeys: ["top_logprobs", "topLogprobs"], payloadKey: "top_logprobs" },
   { bodyKeys: ["parallel_tool_calls", "parallelToolCalls"], payloadKey: "parallel_tool_calls" },
   { bodyKeys: ["tool_choice", "toolChoice"], payloadKey: "tool_choice" },
-  { bodyKeys: ["max_completion_tokens", "maxCompletionTokens"], payloadKey: "max_output_tokens" }
+  { bodyKeys: ["maxCompletionTokens"], payloadKey: "maxCompletionTokens" },
+  { bodyKeys: ["max_completion_tokens"], payloadKey: "max_completion_tokens" }
 ];
 
 function firstValidCandidate(maxLength: number, candidates: Candidate[]): ResolvedCandidate | undefined {
