@@ -691,10 +691,6 @@ interface NormalizedToolCall {
   argumentsText: string;
 }
 
-interface CompletedToolExecution extends NormalizedToolCall {
-  output: unknown;
-}
-
 type ObservationWithChildren = Pick<LangfuseSpan, "startObservation">;
 
 function stringifyToolCallArguments(value: unknown): string {
@@ -777,139 +773,21 @@ function parseToolArgumentsForObservation(argumentsText: string): unknown {
   }
 }
 
-function toolMessageContentToObservationOutput(
-  content: OpenAIChatRequest["messages"][number]["content"]
-): unknown {
-  if (typeof content === "string") {
-    return content;
-  }
-
-  if (!Array.isArray(content)) {
-    return null;
-  }
-
-  const textParts = content
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .filter((text) => text.length > 0);
-
-  if (textParts.length > 0) {
-    return textParts.join("\n");
-  }
-
-  return content;
-}
-
-function extractRecentCompletedToolExecutions(messages: OpenAIChatRequest["messages"]): CompletedToolExecution[] {
-  const lastUserMessageIndex = (() => {
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      if (messages[i].role === "user") {
-        return i;
-      }
-    }
-    return -1;
-  })();
-
-  // Only associate tool activity that happened after the latest user message (current turn).
-  const currentTurnStart = lastUserMessageIndex >= 0 ? lastUserMessageIndex : messages.length;
-
-  let lastAssistantWithToolCallsIndex = -1;
-  for (let i = messages.length - 1; i > currentTurnStart; i -= 1) {
-    const message = messages[i];
-    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-      lastAssistantWithToolCallsIndex = i;
-      break;
-    }
-  }
-
-  if (lastAssistantWithToolCallsIndex < 0) {
-    return [];
-  }
-
-  const assistantMessage = messages[lastAssistantWithToolCallsIndex];
-  const recentToolCalls =
-    assistantMessage.role === "assistant" && Array.isArray(assistantMessage.tool_calls)
-      ? assistantMessage.tool_calls
-      : [];
-  const toolCallById = new Map<string, NormalizedToolCall>();
-  for (const toolCall of recentToolCalls) {
-    if (!toolCall || typeof toolCall !== "object") {
-      continue;
-    }
-    const toolCallId = normalizeId(toolCall.id, 200);
-    if (!toolCallId) {
-      continue;
-    }
-    toolCallById.set(toolCallId, {
-      id: toolCallId,
-      name: normalizeId(toolCall.function?.name, 200) ?? "tool",
-      argumentsText: typeof toolCall.function?.arguments === "string" ? toolCall.function.arguments : ""
-    });
-  }
-
-  const completedExecutions: CompletedToolExecution[] = [];
-  for (let i = lastAssistantWithToolCallsIndex + 1; i < messages.length; i += 1) {
-    const message = messages[i];
-    if (message.role !== "tool") {
-      continue;
-    }
-    const toolCallId = normalizeId(message.tool_call_id, 200);
-    const matchedCall = toolCallId ? toolCallById.get(toolCallId) : undefined;
-    const fallbackName = normalizeId(message.name, 200) ?? "tool";
-    const fallbackId = toolCallId ?? `tool_result_${i}`;
-
-    completedExecutions.push({
-      id: fallbackId,
-      name: matchedCall?.name ?? fallbackName,
-      argumentsText: matchedCall?.argumentsText ?? "",
-      output: toolMessageContentToObservationOutput(message.content)
-    });
-  }
-
-  return completedExecutions;
-}
-
-function emitCompletedToolResultObservations(
-  parent: ObservationWithChildren,
-  completedExecutions: CompletedToolExecution[]
-): void {
-  for (const execution of completedExecutions) {
-    const toolObservation = parent.startObservation(
-      `tool_result.${execution.name}`,
-      {
-        input: parseToolArgumentsForObservation(execution.argumentsText),
-        output: execution.output,
-        metadata: {
-          toolCallId: execution.id,
-          phase: "tool_result_from_history"
-        },
-        statusMessage: "Tool result observed from request history."
-      },
-      { asType: "tool" }
-    );
-    toolObservation.end();
-  }
-}
-
 function emitRequestedToolCallObservations(parent: ObservationWithChildren, toolCalls: NormalizedToolCall[]): void {
   for (const toolCall of toolCalls) {
-    const toolObservation = parent.startObservation(
-      `tool.${toolCall.name}`,
+    const toolRequestEvent = parent.startObservation(
+      `tool_request.${toolCall.name}`,
       {
         input: parseToolArgumentsForObservation(toolCall.argumentsText),
-        output: {
-          status: "requested",
-          detail: "Tool call requested by model; awaiting runtime result."
-        },
         metadata: {
           toolCallId: toolCall.id,
           phase: "model_requested"
         },
-        statusMessage: "Tool call requested by model. Runtime executes this tool outside the proxy."
+        statusMessage: "Tool call requested by model. Execution happens outside this proxy."
       },
-      { asType: "tool" }
+      { asType: "event" }
     );
-    toolObservation.end();
+    toolRequestEvent.end();
   }
 }
 
@@ -1482,7 +1360,6 @@ async function handleChatCompletions(
         tags: toolContext.isAgentic
           ? ["openai-proxy", "chat.completions", "agentic"]
           : ["openai-proxy", "chat.completions"],
-        input: body.messages,
         metadata: {
           model: body.model,
           stream: body.stream === true,
@@ -1498,12 +1375,11 @@ async function handleChatCompletions(
           toolContext
         }
       });
-      rootObservation.update({ input: { messages: body.messages } });
-
-      const completedToolExecutions = extractRecentCompletedToolExecutions(body.messages);
-      if (completedToolExecutions.length > 0) {
-        emitCompletedToolResultObservations(rootObservation, completedToolExecutions);
+      // In agentic loops, later requests include accumulated history. Keep trace input from the initial request only.
+      if (toolContext.assistantToolCallsInInput === 0 && toolContext.toolMessagesInInput === 0) {
+        rootObservation.updateTrace({ input: body.messages });
       }
+      rootObservation.update({ input: { messages: body.messages } });
 
       const generation = startObservation(
         "chat_completion",
@@ -1563,7 +1439,9 @@ async function handleChatCompletions(
         } else {
           rootObservation.update({ output: streamOutput });
         }
-        rootObservation.updateTrace({ output: streamOutput });
+        if (!streamFailureMessage && streamOutcome.streamFinishReason !== "tool_calls") {
+          rootObservation.updateTrace({ output: streamOutput });
+        }
         if (streamFailureMessage) {
           writeLog("warn", "chat.request.stream_incomplete", {
             request_id: requestId,
@@ -1624,7 +1502,9 @@ async function handleChatCompletions(
         .end();
 
       rootObservation.update({ output: responseMessage });
-      rootObservation.updateTrace({ output: responseMessage });
+      if (responseBody.choices[0]?.finish_reason !== "tool_calls") {
+        rootObservation.updateTrace({ output: responseMessage });
+      }
 
       writeLog("info", "chat.request.complete", {
         request_id: requestId,
