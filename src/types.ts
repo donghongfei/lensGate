@@ -71,13 +71,28 @@ export interface OpenAIChatRequest {
 export interface OpenAIChatResponseChoice {
   index: number;
   message: OpenAIMessage;
+  logprobs: null;
   finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null;
+}
+
+export interface OpenAICompletionTokensDetails {
+  reasoning_tokens: number;
+  audio_tokens: number;
+  accepted_prediction_tokens: number;
+  rejected_prediction_tokens: number;
+}
+
+export interface OpenAIPromptTokensDetails {
+  cached_tokens: number;
+  audio_tokens: number;
 }
 
 export interface OpenAIUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  completion_tokens_details: OpenAICompletionTokensDetails;
+  prompt_tokens_details: OpenAIPromptTokensDetails;
 }
 
 export interface OpenAIChatResponse {
@@ -85,6 +100,7 @@ export interface OpenAIChatResponse {
   object: "chat.completion";
   created: number;
   model: string;
+  system_fingerprint: string;
   choices: OpenAIChatResponseChoice[];
   usage: OpenAIUsage;
 }
@@ -92,6 +108,7 @@ export interface OpenAIChatResponse {
 export interface OpenAIChatChunkChoice {
   index: number;
   delta: Partial<OpenAIMessage>;
+  logprobs: null;
   finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null;
 }
 
@@ -100,6 +117,7 @@ export interface OpenAIChatChunk {
   object: "chat.completion.chunk";
   created: number;
   model: string;
+  system_fingerprint: string;
   choices: OpenAIChatChunkChoice[];
 }
 
@@ -108,6 +126,8 @@ export interface OpenAIModelObject {
   object: "model";
   created: number;
   owned_by: string;
+  context_window?: number;
+  max_tokens?: number;
 }
 
 export interface OpenAIModelsResponse {

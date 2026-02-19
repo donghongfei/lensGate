@@ -9,6 +9,8 @@ import type {
   OpenAIToolCall
 } from "./types.js";
 
+const SYSTEM_FINGERPRINT = "fp_lensgate";
+
 export class ImageNotSupportedError extends Error {
   constructor(message = "image_url content is not supported by this proxy.") {
     super(message);
@@ -207,10 +209,12 @@ function toChunk(
     object: "chat.completion.chunk",
     created: state.created,
     model: state.model,
+    system_fingerprint: SYSTEM_FINGERPRINT,
     choices: [
       {
         index: 0,
         delta,
+        logprobs: null,
         finish_reason: finishReason
       }
     ]
@@ -501,22 +505,44 @@ export function assistantMessageToResponse(
     responseMessage.tool_calls = toolCalls;
   }
 
+  const reasoningTokens = safeNumber(
+    (usage as Record<string, unknown>).reasoning_tokens,
+    (usage as Record<string, unknown>).reasoningTokens
+  );
+  const cachedTokens = safeNumber(
+    (usage as Record<string, unknown>).cached_tokens,
+    (usage as Record<string, unknown>).cacheReadTokens,
+    (usage as Record<string, unknown>).cacheRead
+  );
+
   return {
     id: completionId,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model: requestedModelId,
+    system_fingerprint: SYSTEM_FINGERPRINT,
     choices: [
       {
         index: 0,
         message: responseMessage,
+        logprobs: null,
         finish_reason: toolCalls.length > 0 ? "tool_calls" : mapStopReason(record.stopReason ?? record.reason)
       }
     ],
     usage: {
       prompt_tokens: promptTokens,
       completion_tokens: completionTokens,
-      total_tokens: promptTokens + completionTokens
+      total_tokens: promptTokens + completionTokens,
+      completion_tokens_details: {
+        reasoning_tokens: reasoningTokens,
+        audio_tokens: 0,
+        accepted_prediction_tokens: 0,
+        rejected_prediction_tokens: 0
+      },
+      prompt_tokens_details: {
+        cached_tokens: cachedTokens,
+        audio_tokens: 0
+      }
     }
   };
 }

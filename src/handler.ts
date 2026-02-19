@@ -312,11 +312,16 @@ async function writeSSEStream(
 
 function toOpenAIModelObject(model: unknown): OpenAIModelObject {
   const id = modelIdFromUnknown(model);
+  const record = model && typeof model === "object" ? (model as Record<string, unknown>) : {};
+  const contextWindow = typeof record.contextWindow === "number" ? record.contextWindow : undefined;
+  const maxTokens = typeof record.maxTokens === "number" ? record.maxTokens : undefined;
   return {
     id,
     object: "model",
     created: Math.floor(Date.now() / 1000),
-    owned_by: "openai"
+    owned_by: "openai",
+    ...(contextWindow !== undefined ? { context_window: contextWindow } : {}),
+    ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {})
   };
 }
 
