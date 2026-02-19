@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import { streamSimple } from "@mariozechner/pi-ai";
-import { startActiveObservation, startObservation } from "@langfuse/tracing";
+import { propagateAttributes, startActiveObservation, startObservation } from "@langfuse/tracing";
 import { getAccessToken, NotLoggedInError } from "./auth.js";
 import { BODY_LIMIT_BYTES, CORS_ALLOW_ORIGIN, LOG_LEVEL, PROXY_API_KEY } from "./config.js";
 import {
@@ -95,16 +95,138 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function getRequestId(request: IncomingMessage): string {
-  const headerValue = request.headers["x-request-id"];
+function normalizeId(value: unknown, maxLength: number): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > maxLength) {
+    return null;
+  }
+  return trimmed;
+}
+
+function readHeaderString(request: IncomingMessage, headerName: string, maxLength: number): string | null {
+  const headerValue = request.headers[headerName];
   const candidate = Array.isArray(headerValue) ? headerValue[0] : headerValue;
-  if (typeof candidate === "string") {
-    const trimmed = candidate.trim();
-    if (trimmed.length > 0 && trimmed.length <= 128) {
-      return trimmed;
-    }
+  return normalizeId(candidate, maxLength);
+}
+
+function getRequestId(request: IncomingMessage): string {
+  const requestId = readHeaderString(request, "x-request-id", 128);
+  if (requestId) {
+    return requestId;
   }
   return `req_${randomBytes(8).toString("hex")}`;
+}
+
+function firstValidId(maxLength: number, ...candidates: unknown[]): string | undefined {
+  for (const candidate of candidates) {
+    const value = normalizeId(candidate, maxLength);
+    if (value) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function getSessionId(request: IncomingMessage, body: OpenAIChatRequest): string | undefined {
+  const bodyRecord = body as Record<string, unknown>;
+  return firstValidId(
+    200,
+    bodyRecord.session_id,
+    bodyRecord.sessionId,
+    bodyRecord.conversation_id,
+    bodyRecord.conversationId,
+    bodyRecord.thread_id,
+    bodyRecord.threadId,
+    readHeaderString(request, "x-session-id", 200),
+    readHeaderString(request, "x-conversation-id", 200),
+    readHeaderString(request, "x-thread-id", 200)
+  );
+}
+
+function getUserId(request: IncomingMessage, body: OpenAIChatRequest): string | undefined {
+  const bodyRecord = body as Record<string, unknown>;
+  return firstValidId(
+    200,
+    bodyRecord.user,
+    bodyRecord.user_id,
+    bodyRecord.userId,
+    readHeaderString(request, "x-user-id", 200)
+  );
+}
+
+function getTurnId(request: IncomingMessage, body: OpenAIChatRequest): string | undefined {
+  const bodyRecord = body as Record<string, unknown>;
+  return firstValidId(
+    200,
+    bodyRecord.turn_id,
+    bodyRecord.turnId,
+    bodyRecord.workflow_id,
+    bodyRecord.workflowId,
+    bodyRecord.chat_id,
+    bodyRecord.chatId,
+    readHeaderString(request, "x-turn-id", 200),
+    readHeaderString(request, "x-workflow-id", 200),
+    readHeaderString(request, "x-chat-id", 200),
+    readHeaderString(request, "x-correlation-id", 200),
+    readHeaderString(request, "x-trace-id", 200)
+  );
+}
+
+function buildCorrelationHints(
+  request: IncomingMessage,
+  body: OpenAIChatRequest,
+  derived: { sessionId?: string; userId?: string; turnId?: string }
+): Record<string, unknown> {
+  const bodyRecord = body as Record<string, unknown>;
+
+  const bodyKeys = Object.keys(bodyRecord).filter((key) => !["messages", "tools"].includes(key));
+  const headerKeys = Object.keys(request.headers)
+    .map((key) => key.toLowerCase())
+    .filter((key) => key !== "authorization");
+
+  return {
+    body_keys: bodyKeys.slice(0, 40),
+    header_keys: headerKeys.slice(0, 40),
+    body_candidates: {
+      session_id: normalizeId(bodyRecord.session_id, 200),
+      sessionId: normalizeId(bodyRecord.sessionId, 200),
+      conversation_id: normalizeId(bodyRecord.conversation_id, 200),
+      conversationId: normalizeId(bodyRecord.conversationId, 200),
+      thread_id: normalizeId(bodyRecord.thread_id, 200),
+      threadId: normalizeId(bodyRecord.threadId, 200),
+      turn_id: normalizeId(bodyRecord.turn_id, 200),
+      turnId: normalizeId(bodyRecord.turnId, 200),
+      workflow_id: normalizeId(bodyRecord.workflow_id, 200),
+      workflowId: normalizeId(bodyRecord.workflowId, 200),
+      chat_id: normalizeId(bodyRecord.chat_id, 200),
+      chatId: normalizeId(bodyRecord.chatId, 200),
+      user: normalizeId(bodyRecord.user, 200),
+      user_id: normalizeId(bodyRecord.user_id, 200),
+      userId: normalizeId(bodyRecord.userId, 200)
+    },
+    header_candidates: {
+      x_session_id: readHeaderString(request, "x-session-id", 200),
+      x_conversation_id: readHeaderString(request, "x-conversation-id", 200),
+      x_thread_id: readHeaderString(request, "x-thread-id", 200),
+      x_turn_id: readHeaderString(request, "x-turn-id", 200),
+      x_workflow_id: readHeaderString(request, "x-workflow-id", 200),
+      x_chat_id: readHeaderString(request, "x-chat-id", 200),
+      x_user_id: readHeaderString(request, "x-user-id", 200),
+      x_correlation_id: readHeaderString(request, "x-correlation-id", 200),
+      x_trace_id: readHeaderString(request, "x-trace-id", 200),
+      traceparent: readHeaderString(request, "traceparent", 512),
+      tracestate: readHeaderString(request, "tracestate", 512),
+      baggage: readHeaderString(request, "baggage", 512)
+    },
+    derived: {
+      session_id: derived.sessionId ?? null,
+      user_id: derived.userId ?? null,
+      turn_id: derived.turnId ?? null
+    }
+  };
 }
 
 function setCorsHeaders(response: ServerResponse): void {
@@ -539,6 +661,9 @@ async function handleChatCompletions(
   validateApiKeyHeader(request);
 
   const body = await parseChatRequest(request);
+  const sessionId = getSessionId(request, body);
+  const userId = getUserId(request, body);
+  const turnId = getTurnId(request, body);
   const requestedModelId = body.model;
   const model = resolveCodexModel(requestedModelId);
   const context = openAIRequestToContext(body);
@@ -557,7 +682,15 @@ async function handleChatCompletions(
   writeLog("info", "chat.request.start", {
     request_id: requestId,
     requested_model: body.model,
-    stream: body.stream === true
+    stream: body.stream === true,
+    session_id: sessionId ?? null,
+    user_id: userId ?? null,
+    turn_id: turnId ?? null
+  });
+
+  writeLog("info", "chat.request.correlation_hints", {
+    request_id: requestId,
+    ...buildCorrelationHints(request, body, { sessionId, userId, turnId })
   });
 
   const modelParameters: Record<string, number> = {};
@@ -566,83 +699,101 @@ async function handleChatCompletions(
   if (typeof body.top_p === "number") modelParameters.top_p = body.top_p;
 
   await startActiveObservation("chat", async (trace) => {
-    trace.updateTrace({
-      sessionId: requestId,
-      input: { messages: body.messages },
-      metadata: { model: body.model, stream: body.stream === true }
-    });
-    trace.update({ input: { messages: body.messages } });
-
-    const generation = startObservation(
-      "chat_completion",
-      {
-        model: body.model,
+    const executeCompletion = async (): Promise<void> => {
+      trace.updateTrace({
+        ...(sessionId ? { sessionId } : {}),
+        ...(userId ? { userId } : {}),
         input: { messages: body.messages },
-        modelParameters
-      },
-      { asType: "generation", startTime: new Date(startedAt) }
-    );
+        metadata: { model: body.model, stream: body.stream === true, requestId }
+      });
+      trace.update({ input: { messages: body.messages } });
 
-    const eventStream = streamSimple(model as never, context as never, streamOptions as never);
+      const generation = startObservation(
+        "chat_completion",
+        {
+          model: body.model,
+          input: { messages: body.messages },
+          modelParameters
+        },
+        { asType: "generation", startTime: new Date(startedAt) }
+      );
 
-    if (body.stream === true) {
-      const streamOutcome = await writeSSEStream(response, eventStream, requestedModelId, requestId, body.stream_options?.include_usage === true);
-      const streamOutput = streamOutcome.accumulatedText || streamOutcome.streamMessage;
+      const eventStream = streamSimple(model as never, context as never, streamOptions as never);
+
+      if (body.stream === true) {
+        const streamOutcome = await writeSSEStream(response, eventStream, requestedModelId, requestId, body.stream_options?.include_usage === true);
+        const streamOutput = streamOutcome.accumulatedText || streamOutcome.streamMessage;
+        generation.update({
+          output: streamOutput,
+          ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {})
+        }).end();
+        trace.update({ output: streamOutput });
+        writeLog("info", "chat.request.complete", {
+          request_id: requestId,
+          model: requestedModelId,
+          stream: true,
+          status_code: response.statusCode,
+          duration_ms: Date.now() - startedAt,
+          emitted_output: streamOutcome.emittedAnyOutput
+        });
+        return;
+      }
+
+      const assistantMessage = await getFinalAssistantMessage(eventStream);
+      if (!assistantMessage) {
+        generation.update({ level: "ERROR", statusMessage: "No final assistant message returned." }).end();
+        throw new Error("No final assistant message returned from upstream stream.");
+      }
+
+      const stopReason = getAssistantStopReason(assistantMessage);
+      if (stopReason === "error" || stopReason === "aborted") {
+        const message =
+          getAssistantErrorMessage(assistantMessage) || `Upstream request failed with stop reason '${stopReason}'.`;
+        generation.update({ level: "ERROR", statusMessage: message }).end();
+        throw new UpstreamModelError(message);
+      }
+
+      const responseBody = assistantMessageToResponse(assistantMessage, requestedModelId, generateCompletionId());
+      sendJson(response, 200, responseBody);
+
+      const responseMessage = responseBody.choices[0]?.message;
       generation.update({
-        output: streamOutput,
-        ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {})
+        output: responseMessage,
+        usageDetails: {
+          input: responseBody.usage.prompt_tokens,
+          output: responseBody.usage.completion_tokens,
+          total: responseBody.usage.total_tokens
+        },
+        ...(responseBody.choices[0]?.finish_reason ? { metadata: { finishReason: responseBody.choices[0].finish_reason } } : {})
       }).end();
-      trace.update({ output: streamOutput });
+      trace.update({ output: responseMessage });
+
       writeLog("info", "chat.request.complete", {
         request_id: requestId,
         model: requestedModelId,
-        stream: true,
-        status_code: response.statusCode,
+        stream: false,
+        status_code: 200,
         duration_ms: Date.now() - startedAt,
-        emitted_output: streamOutcome.emittedAnyOutput
+        finish_reason: responseBody.choices[0]?.finish_reason ?? null,
+        prompt_tokens: responseBody.usage.prompt_tokens,
+        completion_tokens: responseBody.usage.completion_tokens
       });
+    };
+
+    if (!sessionId && !userId) {
+      await executeCompletion();
       return;
     }
 
-    const assistantMessage = await getFinalAssistantMessage(eventStream);
-    if (!assistantMessage) {
-      generation.update({ level: "ERROR", statusMessage: "No final assistant message returned." }).end();
-      throw new Error("No final assistant message returned from upstream stream.");
-    }
-
-    const stopReason = getAssistantStopReason(assistantMessage);
-    if (stopReason === "error" || stopReason === "aborted") {
-      const message =
-        getAssistantErrorMessage(assistantMessage) || `Upstream request failed with stop reason '${stopReason}'.`;
-      generation.update({ level: "ERROR", statusMessage: message }).end();
-      throw new UpstreamModelError(message);
-    }
-
-    const responseBody = assistantMessageToResponse(assistantMessage, requestedModelId, generateCompletionId());
-    sendJson(response, 200, responseBody);
-
-    const responseMessage = responseBody.choices[0]?.message;
-    generation.update({
-      output: responseMessage,
-      usageDetails: {
-        input: responseBody.usage.prompt_tokens,
-        output: responseBody.usage.completion_tokens,
-        total: responseBody.usage.total_tokens
+    await propagateAttributes(
+      {
+        ...(sessionId ? { sessionId } : {}),
+        ...(userId ? { userId } : {})
       },
-      ...(responseBody.choices[0]?.finish_reason ? { metadata: { finishReason: responseBody.choices[0].finish_reason } } : {})
-    }).end();
-    trace.update({ output: responseMessage });
-
-    writeLog("info", "chat.request.complete", {
-      request_id: requestId,
-      model: requestedModelId,
-      stream: false,
-      status_code: 200,
-      duration_ms: Date.now() - startedAt,
-      finish_reason: responseBody.choices[0]?.finish_reason ?? null,
-      prompt_tokens: responseBody.usage.prompt_tokens,
-      completion_tokens: responseBody.usage.completion_tokens
-    });
+      async () => {
+        await executeCompletion();
+      }
+    );
   });
 }
 
