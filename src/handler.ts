@@ -1363,7 +1363,7 @@ async function handleChatCompletions(
     tool_context: toolContext
   });
 
-  writeLog("info", "chat.request.correlation_hints", {
+  writeLog("debug", "chat.request.correlation_hints", {
     request_id: requestId,
     ...buildCorrelationHints(request, body, correlation)
   });
@@ -1433,7 +1433,11 @@ async function handleChatCompletions(
           requestId,
           body.stream_options?.include_usage === true
         );
-        const streamOutput = streamOutcome.streamMessage ?? streamOutcome.accumulatedText;
+        const streamOutput = streamOutcome.accumulatedText || streamOutcome.streamMessage;
+        const requestedToolCalls = extractToolCallsFromUnknown(streamOutcome.streamMessage);
+        if (requestedToolCalls.length > 0) {
+          emitRequestedToolCallObservations(generation, requestedToolCalls);
+        }
         generation
           .update({
             output: streamOutput,
@@ -1449,11 +1453,6 @@ async function handleChatCompletions(
             ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {})
           })
           .end();
-
-        const requestedToolCalls = extractToolCallsFromUnknown(streamOutcome.streamMessage);
-        if (requestedToolCalls.length > 0) {
-          emitRequestedToolCallObservations(generation, requestedToolCalls);
-        }
 
         rootObservation.update({ output: streamOutput });
         writeLog("info", "chat.request.complete", {
@@ -1486,6 +1485,10 @@ async function handleChatCompletions(
       sendJson(response, 200, responseBody);
 
       const responseMessage = responseBody.choices[0]?.message;
+      const requestedToolCalls = extractToolCallsFromUnknown(responseMessage);
+      if (requestedToolCalls.length > 0) {
+        emitRequestedToolCallObservations(generation, requestedToolCalls);
+      }
       generation
         .update({
           output: responseMessage,
@@ -1497,11 +1500,6 @@ async function handleChatCompletions(
           ...(responseBody.choices[0]?.finish_reason ? { metadata: { finishReason: responseBody.choices[0].finish_reason } } : {})
         })
         .end();
-
-      const requestedToolCalls = extractToolCallsFromUnknown(responseMessage);
-      if (requestedToolCalls.length > 0) {
-        emitRequestedToolCallObservations(generation, requestedToolCalls);
-      }
 
       rootObservation.update({ output: responseMessage });
 
