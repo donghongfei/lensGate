@@ -10,9 +10,11 @@
     "start": "node --env-file-if-exists=.env dist/server.js"
   },
   "dependencies": {
+    "@langfuse/otel": "^4.6.1",
+    "@langfuse/tracing": "^4.6.1",
     "@mariozechner/pi-ai": "^0.53.0",
     "@mariozechner/pi-coding-agent": "^0.53.0",
-    "langfuse": "^3.38.6"
+    "@opentelemetry/sdk-node": "^0.212.0"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",

@@ -1,9 +1,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import { streamSimple } from "@mariozechner/pi-ai";
+import { startActiveObservation, startObservation } from "@langfuse/tracing";
 import { getAccessToken, NotLoggedInError } from "./auth.js";
 import { BODY_LIMIT_BYTES, CORS_ALLOW_ORIGIN, LOG_LEVEL, PROXY_API_KEY } from "./config.js";
-import { endGeneration, startGeneration } from "./observe.js";
 import {
   assistantMessageToResponse,
   createStreamState,
@@ -561,65 +561,88 @@ async function handleChatCompletions(
     stream: body.stream === true
   });
 
-  const generation = startGeneration({
-    traceId: requestId,
-    model: body.model,
-    messages: body.messages,
-    temperature: body.temperature,
-    maxTokens: body.max_tokens,
-    topP: body.top_p,
-    startedAt
-  });
+  const modelParameters: Record<string, number> = {};
+  if (typeof body.temperature === "number") modelParameters.temperature = body.temperature;
+  if (typeof body.max_tokens === "number") modelParameters.max_tokens = body.max_tokens;
+  if (typeof body.top_p === "number") modelParameters.top_p = body.top_p;
 
-  const eventStream = streamSimple(model as never, context as never, streamOptions as never);
-
-  if (body.stream === true) {
-    const streamOutcome = await writeSSEStream(response, eventStream, requestedModelId, requestId);
-    endGeneration(generation, {
-      text: streamOutcome.accumulatedText,
-      finishReason: streamOutcome.streamFinishReason ?? undefined
+  await startActiveObservation("chat", async (trace) => {
+    trace.updateTrace({
+      sessionId: requestId,
+      input: { messages: body.messages },
+      metadata: { model: body.model, stream: body.stream === true }
     });
+    trace.update({ input: { messages: body.messages } });
+
+    const generation = startObservation(
+      "chat_completion",
+      {
+        model: body.model,
+        input: { messages: body.messages },
+        modelParameters
+      },
+      { asType: "generation", startTime: new Date(startedAt) }
+    );
+
+    const eventStream = streamSimple(model as never, context as never, streamOptions as never);
+
+    if (body.stream === true) {
+      const streamOutcome = await writeSSEStream(response, eventStream, requestedModelId, requestId);
+      generation.update({
+        output: streamOutcome.accumulatedText,
+        ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {})
+      }).end();
+      trace.update({ output: streamOutcome.accumulatedText });
+      writeLog("info", "chat.request.complete", {
+        request_id: requestId,
+        model: requestedModelId,
+        stream: true,
+        status_code: response.statusCode,
+        duration_ms: Date.now() - startedAt,
+        emitted_output: streamOutcome.emittedAnyOutput
+      });
+      return;
+    }
+
+    const assistantMessage = await getFinalAssistantMessage(eventStream);
+    if (!assistantMessage) {
+      generation.update({ level: "ERROR", statusMessage: "No final assistant message returned." }).end();
+      throw new Error("No final assistant message returned from upstream stream.");
+    }
+
+    const stopReason = getAssistantStopReason(assistantMessage);
+    if (stopReason === "error" || stopReason === "aborted") {
+      const message =
+        getAssistantErrorMessage(assistantMessage) || `Upstream request failed with stop reason '${stopReason}'.`;
+      generation.update({ level: "ERROR", statusMessage: message }).end();
+      throw new UpstreamModelError(message);
+    }
+
+    const responseBody = assistantMessageToResponse(assistantMessage, requestedModelId, generateCompletionId());
+    sendJson(response, 200, responseBody);
+
+    const responseMessage = responseBody.choices[0]?.message;
+    generation.update({
+      output: responseMessage,
+      usageDetails: {
+        input: responseBody.usage.prompt_tokens,
+        output: responseBody.usage.completion_tokens,
+        total: responseBody.usage.total_tokens
+      },
+      ...(responseBody.choices[0]?.finish_reason ? { metadata: { finishReason: responseBody.choices[0].finish_reason } } : {})
+    }).end();
+    trace.update({ output: responseMessage });
+
     writeLog("info", "chat.request.complete", {
       request_id: requestId,
       model: requestedModelId,
-      stream: true,
-      status_code: response.statusCode,
+      stream: false,
+      status_code: 200,
       duration_ms: Date.now() - startedAt,
-      emitted_output: streamOutcome.emittedAnyOutput
+      finish_reason: responseBody.choices[0]?.finish_reason ?? null,
+      prompt_tokens: responseBody.usage.prompt_tokens,
+      completion_tokens: responseBody.usage.completion_tokens
     });
-    return;
-  }
-
-  const assistantMessage = await getFinalAssistantMessage(eventStream);
-  if (!assistantMessage) {
-    throw new Error("No final assistant message returned from upstream stream.");
-  }
-
-  const stopReason = getAssistantStopReason(assistantMessage);
-  if (stopReason === "error" || stopReason === "aborted") {
-    const message =
-      getAssistantErrorMessage(assistantMessage) || `Upstream request failed with stop reason '${stopReason}'.`;
-    throw new UpstreamModelError(message);
-  }
-
-  const responseBody = assistantMessageToResponse(assistantMessage, requestedModelId, generateCompletionId());
-  sendJson(response, 200, responseBody);
-  endGeneration(generation, {
-    message: responseBody.choices[0]?.message,
-    promptTokens: responseBody.usage.prompt_tokens,
-    completionTokens: responseBody.usage.completion_tokens,
-    totalTokens: responseBody.usage.total_tokens,
-    finishReason: responseBody.choices[0]?.finish_reason ?? undefined
-  });
-  writeLog("info", "chat.request.complete", {
-    request_id: requestId,
-    model: requestedModelId,
-    stream: false,
-    status_code: 200,
-    duration_ms: Date.now() - startedAt,
-    finish_reason: responseBody.choices[0]?.finish_reason ?? null,
-    prompt_tokens: responseBody.usage.prompt_tokens,
-    completion_tokens: responseBody.usage.completion_tokens
   });
 }
 

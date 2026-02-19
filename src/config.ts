@@ -37,4 +37,4 @@ export const LANGFUSE_SECRET_KEY = process.env.LANGFUSE_SECRET_KEY ?? "";
  * Langfuse 服务地址（自建实例时修改）
  * 默认 https://cloud.langfuse.com
  */
-export const LANGFUSE_HOST = process.env.LANGFUSE_HOST ?? "";
+export const LANGFUSE_BASE_URL = process.env.LANGFUSE_BASE_URL ?? "";
