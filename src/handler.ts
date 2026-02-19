@@ -202,6 +202,123 @@ const OPENAI_PAYLOAD_PASSTHROUGH_RULES: PayloadPassthroughRule[] = [
   { bodyKeys: ["maxCompletionTokens"], payloadKey: "maxCompletionTokens" }
 ];
 
+interface ActiveAgentTurn {
+  observation: LangfuseAgent;
+  traceId: string;
+  createdAt: number;
+  lastActivityAt: number;
+  hasTraceInput: boolean;
+  idleTimer: ReturnType<typeof setTimeout>;
+}
+
+const ACTIVE_AGENT_TURNS = new Map<string, ActiveAgentTurn>();
+const AGENT_TURN_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+function scheduleActiveAgentTurnTimeout(traceId: string): void {
+  const activeAgentTurn = ACTIVE_AGENT_TURNS.get(traceId);
+  if (!activeAgentTurn) {
+    return;
+  }
+
+  clearTimeout(activeAgentTurn.idleTimer);
+  activeAgentTurn.lastActivityAt = Date.now();
+  activeAgentTurn.idleTimer = setTimeout(() => {
+    const current = ACTIVE_AGENT_TURNS.get(traceId);
+    if (!current) {
+      return;
+    }
+    ACTIVE_AGENT_TURNS.delete(traceId);
+
+    try {
+      current.observation
+        .update({
+          level: "WARNING",
+          statusMessage: "Agent turn timed out before receiving a terminal response."
+        })
+        .end();
+    } catch {
+      // ignore close failures during timeout cleanup
+    }
+
+    writeLog("warn", "chat.agent_turn.timeout", {
+      trace_id: traceId,
+      idle_ms: Date.now() - current.lastActivityAt,
+      duration_ms: Date.now() - current.createdAt
+    });
+  }, AGENT_TURN_IDLE_TIMEOUT_MS);
+  activeAgentTurn.idleTimer.unref?.();
+}
+
+function getOrCreateActiveAgentTurn(
+  traceId: string,
+  startContext: { startTime: Date; parentSpanContext?: ParentSpanContext },
+  requestId: string
+): ActiveAgentTurn {
+  const existing = ACTIVE_AGENT_TURNS.get(traceId);
+  if (existing) {
+    scheduleActiveAgentTurnTimeout(traceId);
+    writeLog("debug", "chat.agent_turn.reuse", {
+      request_id: requestId,
+      trace_id: traceId,
+      age_ms: Date.now() - existing.createdAt
+    });
+    return existing;
+  }
+
+  const observation = startContext.parentSpanContext
+    ? startObservation("chat.turn.agent", {}, { asType: "agent", startTime: startContext.startTime, parentSpanContext: startContext.parentSpanContext })
+    : startObservation("chat.turn.agent", {}, { asType: "agent", startTime: startContext.startTime });
+  const activeAgentTurn: ActiveAgentTurn = {
+    observation,
+    traceId,
+    createdAt: Date.now(),
+    lastActivityAt: Date.now(),
+    hasTraceInput: false,
+    idleTimer: setTimeout(() => undefined, AGENT_TURN_IDLE_TIMEOUT_MS)
+  };
+  ACTIVE_AGENT_TURNS.set(traceId, activeAgentTurn);
+  scheduleActiveAgentTurnTimeout(traceId);
+
+  writeLog("info", "chat.agent_turn.created", {
+    request_id: requestId,
+    trace_id: traceId
+  });
+
+  return activeAgentTurn;
+}
+
+function closeActiveAgentTurn(
+  traceId: string,
+  options?: { requestId?: string; reason?: string; level?: "WARNING" | "ERROR"; statusMessage?: string }
+): void {
+  const activeAgentTurn = ACTIVE_AGENT_TURNS.get(traceId);
+  if (!activeAgentTurn) {
+    return;
+  }
+
+  ACTIVE_AGENT_TURNS.delete(traceId);
+  clearTimeout(activeAgentTurn.idleTimer);
+
+  try {
+    if (options?.level || options?.statusMessage) {
+      activeAgentTurn.observation.update({
+        ...(options.level ? { level: options.level } : {}),
+        ...(options.statusMessage ? { statusMessage: options.statusMessage } : {})
+      });
+    }
+    activeAgentTurn.observation.end();
+  } catch {
+    // ignore close failures; the map entry is already removed
+  }
+
+  writeLog("info", "chat.agent_turn.closed", {
+    request_id: options?.requestId ?? null,
+    trace_id: traceId,
+    reason: options?.reason ?? "terminal_response",
+    duration_ms: Date.now() - activeAgentTurn.createdAt
+  });
+}
+
 function firstValidCandidate(maxLength: number, candidates: Candidate[]): ResolvedCandidate | undefined {
   for (const candidate of candidates) {
     const value = normalizeId(candidate.value, maxLength);
@@ -1460,193 +1577,206 @@ async function handleChatCompletions(
   if (typeof body.frequency_penalty === "number") modelParameters.frequency_penalty = body.frequency_penalty;
   if (typeof body.presence_penalty === "number") modelParameters.presence_penalty = body.presence_penalty;
 
-  const runWithRootObservation = async (rootObservation: LangfuseSpan | LangfuseAgent): Promise<void> => {
-    const executeCompletion = async (): Promise<void> => {
-      rootObservation.updateTrace({
-        name: toolContext.isAgentic ? "openai.chat.agent_turn" : "openai.chat.turn",
-        ...(sessionId ? { sessionId } : {}),
-        ...(userId ? { userId } : {}),
-        tags: toolContext.isAgentic
-          ? ["openai-proxy", "chat.completions", "agentic"]
-          : ["openai-proxy", "chat.completions"],
-        metadata: {
-          model: body.model,
-          stream: body.stream === true,
-          requestId,
-          turnId: turnId ?? null,
-          traceId: traceId ?? null,
-          correlation: {
-            sessionSource: correlation.sources.sessionId ?? null,
-            userSource: correlation.sources.userId ?? null,
-            turnSource: correlation.sources.turnId ?? null,
-            traceSource: correlation.sources.traceId ?? null
-          },
-          toolContext
-        }
-      });
-      // In agentic loops, later requests include accumulated history. Keep trace input from the initial request only.
-      if (toolContext.assistantToolCallsInInput === 0 && toolContext.toolMessagesInInput === 0) {
-        rootObservation.updateTrace({ input: body.messages });
-      }
-      rootObservation.update({ input: { messages: body.messages } });
-
-      const incomingToolResults = extractIncomingToolResults(body.messages);
-      if (incomingToolResults.length > 0) {
-        emitIncomingToolResultObservations(rootObservation, incomingToolResults);
-      }
-
-      const generation = startObservation(
-        "chat_completion",
-        {
-          model: body.model,
-          input: { messages: body.messages },
-          modelParameters
-        },
-        { asType: "generation" }
-      );
-
-      const eventStream = streamSimple(model as never, context as never, streamOptions as never);
-
-      if (body.stream === true) {
-        const streamOutcome = await writeSSEStream(
-          response,
-          eventStream,
-          requestedModelId,
-          requestId,
-          body.stream_options?.include_usage === true,
-          upstreamAbortController
-        );
-        // Prefer structured stream message to preserve tool-call payloads for tracing.
-        const streamOutput = streamOutcome.streamMessage ?? streamOutcome.accumulatedText;
-        const requestedToolCalls = extractToolCallsFromUnknown(streamOutcome.streamMessage);
-        if (requestedToolCalls.length > 0) {
-          emitRequestedToolCallObservations(generation, requestedToolCalls);
-        }
-        const streamFailureMessage = streamOutcome.clientDisconnected
-          ? "Client disconnected before stream completion."
-          : streamOutcome.iterationErrorMessage
-            ? `Streaming interrupted: ${streamOutcome.iterationErrorMessage}`
-            : null;
-        generation
-          .update({
-            output: streamOutput,
-            ...(streamOutcome.streamUsage
-              ? {
-                  usageDetails: {
-                    input: streamOutcome.streamUsage.prompt_tokens,
-                    output: streamOutcome.streamUsage.completion_tokens,
-                    total: streamOutcome.streamUsage.total_tokens
-                  }
-                }
-              : {}),
-            ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {}),
-            ...(streamFailureMessage ? { level: "ERROR", statusMessage: streamFailureMessage } : {})
-          })
-          .end();
-
-        if (streamFailureMessage) {
-          rootObservation.update({
-            output: streamOutput,
-            level: "ERROR",
-            statusMessage: streamFailureMessage
-          });
-        } else {
-          rootObservation.update({ output: streamOutput });
-        }
-        if (!streamFailureMessage && streamOutcome.streamFinishReason !== "tool_calls") {
-          rootObservation.updateTrace({ output: streamOutput });
-        }
-        if (streamFailureMessage) {
-          writeLog("warn", "chat.request.stream_incomplete", {
-            request_id: requestId,
-            model: requestedModelId,
-            stream: true,
-            status_code: response.statusCode,
-            duration_ms: Date.now() - startedAt,
-            emitted_output: streamOutcome.emittedAnyOutput,
-            tool_calls_requested: requestedToolCalls.length,
-            message: streamFailureMessage
-          });
-        } else {
-          writeLog("info", "chat.request.complete", {
-            request_id: requestId,
-            model: requestedModelId,
-            stream: true,
-            status_code: response.statusCode,
-            duration_ms: Date.now() - startedAt,
-            emitted_output: streamOutcome.emittedAnyOutput,
-            tool_calls_requested: requestedToolCalls.length
-          });
-        }
-        return;
-      }
-
-      const assistantMessage = await getFinalAssistantMessage(eventStream);
-      if (!assistantMessage) {
-        generation.update({ level: "ERROR", statusMessage: "No final assistant message returned." }).end();
-        throw new Error("No final assistant message returned from upstream stream.");
-      }
-
-      const stopReason = getAssistantStopReason(assistantMessage);
-      if (stopReason === "error" || stopReason === "aborted") {
-        const message =
-          getAssistantErrorMessage(assistantMessage) || `Upstream request failed with stop reason '${stopReason}'.`;
-        generation.update({ level: "ERROR", statusMessage: message }).end();
-        throw new UpstreamModelError(message);
-      }
-
-      const responseBody = assistantMessageToResponse(assistantMessage, requestedModelId, generateCompletionId());
-      sendJson(response, 200, responseBody);
-
-      const responseMessage = responseBody.choices[0]?.message;
-      const requestedToolCalls = extractToolCallsFromUnknown(responseMessage);
-      if (requestedToolCalls.length > 0) {
-        emitRequestedToolCallObservations(generation, requestedToolCalls);
-      }
-      generation
-        .update({
-          output: responseMessage,
-          usageDetails: {
-            input: responseBody.usage.prompt_tokens,
-            output: responseBody.usage.completion_tokens,
-            total: responseBody.usage.total_tokens
-          },
-          ...(responseBody.choices[0]?.finish_reason ? { metadata: { finishReason: responseBody.choices[0].finish_reason } } : {})
-        })
-        .end();
-
-      rootObservation.update({ output: responseMessage });
-      if (responseBody.choices[0]?.finish_reason !== "tool_calls") {
-        rootObservation.updateTrace({ output: responseMessage });
-      }
-
-      writeLog("info", "chat.request.complete", {
-        request_id: requestId,
-        model: requestedModelId,
-        stream: false,
-        status_code: 200,
-        duration_ms: Date.now() - startedAt,
-        finish_reason: responseBody.choices[0]?.finish_reason ?? null,
-        prompt_tokens: responseBody.usage.prompt_tokens,
-        completion_tokens: responseBody.usage.completion_tokens,
-        tool_calls_requested: requestedToolCalls.length
-      });
-    };
-
+  const withTraceAttributes = async <T>(fn: () => Promise<T>): Promise<T> => {
     if (!sessionId && !userId) {
-      await executeCompletion();
-      return;
+      return fn();
     }
 
-    await propagateAttributes(
+    return propagateAttributes(
       {
         ...(sessionId ? { sessionId } : {}),
         ...(userId ? { userId } : {})
       },
-      async () => {
-        await executeCompletion();
-      }
+      fn
     );
+  };
+
+  const executeCompletion = async (
+    rootObservation: LangfuseSpan | LangfuseAgent,
+    options?: { activeAgentTurn?: ActiveAgentTurn }
+  ): Promise<{ endAgentTurn: boolean }> => {
+    rootObservation.updateTrace({
+      name: toolContext.isAgentic ? "openai.chat.agent_turn" : "openai.chat.turn",
+      ...(sessionId ? { sessionId } : {}),
+      ...(userId ? { userId } : {}),
+      tags: toolContext.isAgentic
+        ? ["openai-proxy", "chat.completions", "agentic"]
+        : ["openai-proxy", "chat.completions"],
+      metadata: {
+        model: body.model,
+        stream: body.stream === true,
+        requestId,
+        turnId: turnId ?? null,
+        traceId: traceId ?? null,
+        correlation: {
+          sessionSource: correlation.sources.sessionId ?? null,
+          userSource: correlation.sources.userId ?? null,
+          turnSource: correlation.sources.turnId ?? null,
+          traceSource: correlation.sources.traceId ?? null
+        },
+        toolContext
+      }
+    });
+
+    const shouldSetTraceInput =
+      (!options?.activeAgentTurn || !options.activeAgentTurn.hasTraceInput) &&
+      toolContext.assistantToolCallsInInput === 0 &&
+      toolContext.toolMessagesInInput === 0;
+    if (shouldSetTraceInput) {
+      rootObservation.updateTrace({ input: body.messages });
+      if (options?.activeAgentTurn) {
+        options.activeAgentTurn.hasTraceInput = true;
+      }
+    }
+    rootObservation.update({ input: { messages: body.messages } });
+
+    const incomingToolResults = extractIncomingToolResults(body.messages);
+    if (incomingToolResults.length > 0) {
+      emitIncomingToolResultObservations(rootObservation, incomingToolResults);
+    }
+
+    const generation = rootObservation.startObservation(
+      "chat_completion",
+      {
+        model: body.model,
+        input: { messages: body.messages },
+        modelParameters
+      },
+      { asType: "generation" }
+    );
+
+    const eventStream = streamSimple(model as never, context as never, streamOptions as never);
+
+    if (body.stream === true) {
+      const streamOutcome = await writeSSEStream(
+        response,
+        eventStream,
+        requestedModelId,
+        requestId,
+        body.stream_options?.include_usage === true,
+        upstreamAbortController
+      );
+      // Prefer structured stream message to preserve tool-call payloads for tracing.
+      const streamOutput = streamOutcome.streamMessage ?? streamOutcome.accumulatedText;
+      const requestedToolCalls = extractToolCallsFromUnknown(streamOutcome.streamMessage);
+      if (requestedToolCalls.length > 0) {
+        emitRequestedToolCallObservations(generation, requestedToolCalls);
+      }
+      const streamFailureMessage = streamOutcome.clientDisconnected
+        ? "Client disconnected before stream completion."
+        : streamOutcome.iterationErrorMessage
+          ? `Streaming interrupted: ${streamOutcome.iterationErrorMessage}`
+          : null;
+      generation
+        .update({
+          output: streamOutput,
+          ...(streamOutcome.streamUsage
+            ? {
+                usageDetails: {
+                  input: streamOutcome.streamUsage.prompt_tokens,
+                  output: streamOutcome.streamUsage.completion_tokens,
+                  total: streamOutcome.streamUsage.total_tokens
+                }
+              }
+            : {}),
+          ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {}),
+          ...(streamFailureMessage ? { level: "ERROR", statusMessage: streamFailureMessage } : {})
+        })
+        .end();
+
+      if (streamFailureMessage) {
+        rootObservation.update({
+          output: streamOutput,
+          level: "ERROR",
+          statusMessage: streamFailureMessage
+        });
+      } else {
+        rootObservation.update({ output: streamOutput });
+      }
+      if (!streamFailureMessage && streamOutcome.streamFinishReason !== "tool_calls") {
+        rootObservation.updateTrace({ output: streamOutput });
+      }
+      if (streamFailureMessage) {
+        writeLog("warn", "chat.request.stream_incomplete", {
+          request_id: requestId,
+          model: requestedModelId,
+          stream: true,
+          status_code: response.statusCode,
+          duration_ms: Date.now() - startedAt,
+          emitted_output: streamOutcome.emittedAnyOutput,
+          tool_calls_requested: requestedToolCalls.length,
+          message: streamFailureMessage
+        });
+      } else {
+        writeLog("info", "chat.request.complete", {
+          request_id: requestId,
+          model: requestedModelId,
+          stream: true,
+          status_code: response.statusCode,
+          duration_ms: Date.now() - startedAt,
+          emitted_output: streamOutcome.emittedAnyOutput,
+          tool_calls_requested: requestedToolCalls.length
+        });
+      }
+
+      return {
+        endAgentTurn: streamFailureMessage !== null || streamOutcome.streamFinishReason !== "tool_calls"
+      };
+    }
+
+    const assistantMessage = await getFinalAssistantMessage(eventStream);
+    if (!assistantMessage) {
+      generation.update({ level: "ERROR", statusMessage: "No final assistant message returned." }).end();
+      throw new Error("No final assistant message returned from upstream stream.");
+    }
+
+    const stopReason = getAssistantStopReason(assistantMessage);
+    if (stopReason === "error" || stopReason === "aborted") {
+      const message = getAssistantErrorMessage(assistantMessage) || `Upstream request failed with stop reason '${stopReason}'.`;
+      generation.update({ level: "ERROR", statusMessage: message }).end();
+      throw new UpstreamModelError(message);
+    }
+
+    const responseBody = assistantMessageToResponse(assistantMessage, requestedModelId, generateCompletionId());
+    sendJson(response, 200, responseBody);
+
+    const responseMessage = responseBody.choices[0]?.message;
+    const requestedToolCalls = extractToolCallsFromUnknown(responseMessage);
+    if (requestedToolCalls.length > 0) {
+      emitRequestedToolCallObservations(generation, requestedToolCalls);
+    }
+    generation
+      .update({
+        output: responseMessage,
+        usageDetails: {
+          input: responseBody.usage.prompt_tokens,
+          output: responseBody.usage.completion_tokens,
+          total: responseBody.usage.total_tokens
+        },
+        ...(responseBody.choices[0]?.finish_reason ? { metadata: { finishReason: responseBody.choices[0].finish_reason } } : {})
+      })
+      .end();
+
+    rootObservation.update({ output: responseMessage });
+    if (responseBody.choices[0]?.finish_reason !== "tool_calls") {
+      rootObservation.updateTrace({ output: responseMessage });
+    }
+
+    writeLog("info", "chat.request.complete", {
+      request_id: requestId,
+      model: requestedModelId,
+      stream: false,
+      status_code: 200,
+      duration_ms: Date.now() - startedAt,
+      finish_reason: responseBody.choices[0]?.finish_reason ?? null,
+      prompt_tokens: responseBody.usage.prompt_tokens,
+      completion_tokens: responseBody.usage.completion_tokens,
+      tool_calls_requested: requestedToolCalls.length
+    });
+
+    return {
+      endAgentTurn: responseBody.choices[0]?.finish_reason !== "tool_calls"
+    };
   };
 
   const startTime = new Date(startedAt);
@@ -1654,11 +1784,46 @@ async function handleChatCompletions(
 
   try {
     if (toolContext.isAgentic) {
-      await startActiveObservation("chat.turn.agent", runWithRootObservation, { ...startContext, asType: "agent" });
+      if (!traceId) {
+        await startActiveObservation(
+          "chat.turn.agent",
+          async (rootObservation) => {
+            await withTraceAttributes(async () => {
+              await executeCompletion(rootObservation);
+            });
+          },
+          { ...startContext, asType: "agent" }
+        );
+        return;
+      }
+
+      const activeAgentTurn = getOrCreateActiveAgentTurn(traceId, startContext, requestId);
+      try {
+        const outcome = await withTraceAttributes(async () =>
+          executeCompletion(activeAgentTurn.observation, { activeAgentTurn })
+        );
+        if (outcome.endAgentTurn) {
+          closeActiveAgentTurn(traceId, { requestId, reason: "terminal_response" });
+        } else {
+          scheduleActiveAgentTurnTimeout(traceId);
+        }
+      } catch (error) {
+        closeActiveAgentTurn(traceId, {
+          requestId,
+          reason: "error",
+          level: "ERROR",
+          statusMessage: getErrorMessage(error)
+        });
+        throw error;
+      }
       return;
     }
 
-    await startActiveObservation("chat.turn", runWithRootObservation, startContext);
+    await startActiveObservation("chat.turn", async (rootObservation) => {
+      await withTraceAttributes(async () => {
+        await executeCompletion(rootObservation);
+      });
+    }, startContext);
   } finally {
     request.off("aborted", abortUpstream);
     response.off("close", abortUpstream);
