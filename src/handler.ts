@@ -691,6 +691,10 @@ interface NormalizedToolCall {
   argumentsText: string;
 }
 
+interface IncomingToolResult extends NormalizedToolCall {
+  output: unknown;
+}
+
 type ObservationWithChildren = Pick<LangfuseSpan, "startObservation">;
 
 function stringifyToolCallArguments(value: unknown): string {
@@ -773,9 +777,115 @@ function parseToolArgumentsForObservation(argumentsText: string): unknown {
   }
 }
 
+function toolMessageContentToObservationOutput(
+  content: OpenAIChatRequest["messages"][number]["content"]
+): unknown {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  const textParts = content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .filter((text) => text.length > 0);
+
+  if (textParts.length > 0) {
+    return textParts.join("\n");
+  }
+
+  return content;
+}
+
+function extractIncomingToolResults(messages: OpenAIChatRequest["messages"]): IncomingToolResult[] {
+  if (messages.length < 2) {
+    return [];
+  }
+
+  let cursor = messages.length - 1;
+  const trailingToolMessages: Array<{ message: OpenAIChatRequest["messages"][number]; index: number }> = [];
+
+  while (cursor >= 0) {
+    const message = messages[cursor];
+    if (message.role !== "tool") {
+      break;
+    }
+    trailingToolMessages.push({ message, index: cursor });
+    cursor -= 1;
+  }
+
+  if (trailingToolMessages.length === 0) {
+    return [];
+  }
+
+  const assistantMessage = messages[cursor];
+  if (
+    !assistantMessage ||
+    assistantMessage.role !== "assistant" ||
+    !Array.isArray(assistantMessage.tool_calls) ||
+    assistantMessage.tool_calls.length === 0
+  ) {
+    return [];
+  }
+
+  const toolCallById = new Map<string, NormalizedToolCall>();
+  for (const toolCall of assistantMessage.tool_calls) {
+    if (!toolCall || typeof toolCall !== "object") {
+      continue;
+    }
+    const toolCallId = normalizeId(toolCall.id, 200);
+    if (!toolCallId) {
+      continue;
+    }
+    toolCallById.set(toolCallId, {
+      id: toolCallId,
+      name: normalizeId(toolCall.function?.name, 200) ?? "tool",
+      argumentsText: typeof toolCall.function?.arguments === "string" ? toolCall.function.arguments : ""
+    });
+  }
+
+  const incomingToolResults: IncomingToolResult[] = [];
+  for (const { message, index } of trailingToolMessages.reverse()) {
+    const toolCallId = normalizeId(message.tool_call_id, 200);
+    const matchedCall = toolCallId ? toolCallById.get(toolCallId) : undefined;
+    const fallbackName = normalizeId(message.name, 200) ?? "tool";
+    const fallbackId = toolCallId ?? `tool_result_${index}`;
+
+    incomingToolResults.push({
+      id: fallbackId,
+      name: matchedCall?.name ?? fallbackName,
+      argumentsText: matchedCall?.argumentsText ?? "",
+      output: toolMessageContentToObservationOutput(message.content)
+    });
+  }
+
+  return incomingToolResults;
+}
+
+function emitIncomingToolResultObservations(parent: ObservationWithChildren, incomingToolResults: IncomingToolResult[]): void {
+  for (const result of incomingToolResults) {
+    parent.startObservation(
+      `tool_result.${result.name}`,
+      {
+        input: parseToolArgumentsForObservation(result.argumentsText),
+        output: result.output,
+        metadata: {
+          toolCallId: result.id,
+          phase: "runtime_result_received"
+        },
+        statusMessage: "Tool result received from runtime input messages."
+      },
+      { asType: "event" }
+    );
+  }
+}
+
 function emitRequestedToolCallObservations(parent: ObservationWithChildren, toolCalls: NormalizedToolCall[]): void {
   for (const toolCall of toolCalls) {
-    const toolRequestEvent = parent.startObservation(
+    parent.startObservation(
       `tool_request.${toolCall.name}`,
       {
         input: parseToolArgumentsForObservation(toolCall.argumentsText),
@@ -787,7 +897,6 @@ function emitRequestedToolCallObservations(parent: ObservationWithChildren, tool
       },
       { asType: "event" }
     );
-    toolRequestEvent.end();
   }
 }
 
@@ -1380,6 +1489,11 @@ async function handleChatCompletions(
         rootObservation.updateTrace({ input: body.messages });
       }
       rootObservation.update({ input: { messages: body.messages } });
+
+      const incomingToolResults = extractIncomingToolResults(body.messages);
+      if (incomingToolResults.length > 0) {
+        emitIncomingToolResultObservations(rootObservation, incomingToolResults);
+      }
 
       const generation = startObservation(
         "chat_completion",
