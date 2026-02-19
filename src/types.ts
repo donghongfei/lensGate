@@ -61,6 +61,7 @@ export interface OpenAIChatRequest {
   stream_options?: { include_usage?: boolean };
   temperature?: number;
   max_tokens?: number;
+  max_completion_tokens?: number;
   tools?: OpenAITool[];
   tool_choice?: OpenAIToolChoice;
   top_p?: number;

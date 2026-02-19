@@ -6,7 +6,11 @@ export class UnknownModelError extends Error {
   modelId: string;
 
   constructor(modelId: string) {
-    super(`Unknown model '${modelId}'. Call GET /v1/models to view supported IDs.`);
+    super(
+      modelId
+        ? `The model '${modelId}' does not exist or you do not have access to it.`
+        : "The requested model does not exist or you do not have access to it."
+    );
     this.name = "UnknownModelError";
     this.modelId = modelId;
   }

@@ -11,6 +11,8 @@ import type {
 } from "./types.js";
 
 const SYSTEM_FINGERPRINT = "fp_lensgate";
+const MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024;
+const IMAGE_FETCH_TIMEOUT_MS = 20_000;
 
 export class ImageNotSupportedError extends Error {
   constructor(message = "image_url content is not supported by this proxy.") {
@@ -33,7 +35,7 @@ export interface StreamState {
   streamMessage: unknown;
 }
 
-function asTextContent(content: string | OpenAIContentPart[] | null, allowImages: boolean): string {
+function asTextContent(content: string | OpenAIContentPart[] | null): string {
   if (typeof content === "string") {
     return content;
   }
@@ -46,13 +48,188 @@ function asTextContent(content: string | OpenAIContentPart[] | null, allowImages
   for (const part of content) {
     if (part.type === "text") {
       parts.push(part.text);
-      continue;
-    }
-    if (part.type === "image_url" && !allowImages) {
-      throw new ImageNotSupportedError();
     }
   }
   return parts.join("");
+}
+
+function isImageMimeType(mimeType: string): boolean {
+  return mimeType.toLowerCase().startsWith("image/");
+}
+
+function inferMimeTypeFromUrl(url: URL): string | null {
+  const pathname = url.pathname.toLowerCase();
+  if (pathname.endsWith(".png")) return "image/png";
+  if (pathname.endsWith(".jpg") || pathname.endsWith(".jpeg")) return "image/jpeg";
+  if (pathname.endsWith(".webp")) return "image/webp";
+  if (pathname.endsWith(".gif")) return "image/gif";
+  if (pathname.endsWith(".bmp")) return "image/bmp";
+  if (pathname.endsWith(".svg")) return "image/svg+xml";
+  if (pathname.endsWith(".avif")) return "image/avif";
+  if (pathname.endsWith(".tif") || pathname.endsWith(".tiff")) return "image/tiff";
+  if (pathname.endsWith(".heic")) return "image/heic";
+  if (pathname.endsWith(".heif")) return "image/heif";
+  return null;
+}
+
+function parseDataUrl(dataUrl: string): { mimeType: string; data: string } {
+  const commaIndex = dataUrl.indexOf(",");
+  if (commaIndex < 0) {
+    throw new ImageNotSupportedError("Invalid image_url data URI.");
+  }
+
+  const metadata = dataUrl.slice(5, commaIndex);
+  const payload = dataUrl.slice(commaIndex + 1);
+  const metadataParts = metadata
+    .split(";")
+    .map((part) => part.trim().toLowerCase())
+    .filter((part) => part.length > 0);
+  const mimeType = metadataParts.length > 0 && !metadataParts[0].includes("=") ? metadataParts[0] : "text/plain";
+  if (!isImageMimeType(mimeType)) {
+    throw new ImageNotSupportedError(`Unsupported image_url media type '${mimeType}'.`);
+  }
+
+  const isBase64 = metadataParts.includes("base64");
+  if (isBase64) {
+    const normalized = payload.trim();
+    if (normalized.length === 0) {
+      throw new ImageNotSupportedError("image_url data URI is empty.");
+    }
+    return { mimeType, data: Buffer.from(normalized, "base64").toString("base64") };
+  }
+
+  const decoded = decodeURIComponent(payload);
+  return { mimeType, data: Buffer.from(decoded, "utf8").toString("base64") };
+}
+
+async function readResponseBodyLimited(response: Response, maxBytes: number): Promise<Buffer> {
+  if (!response.body) {
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    if (buffer.length > maxBytes) {
+      throw new ImageNotSupportedError(`Remote image exceeds ${maxBytes} bytes.`);
+    }
+    return buffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (!value) {
+      continue;
+    }
+    totalBytes += value.byteLength;
+    if (totalBytes > maxBytes) {
+      await reader.cancel();
+      throw new ImageNotSupportedError(`Remote image exceeds ${maxBytes} bytes.`);
+    }
+    chunks.push(Buffer.from(value));
+  }
+
+  return Buffer.concat(chunks, totalBytes);
+}
+
+async function fetchRemoteImageAsBase64(url: URL): Promise<{ mimeType: string; data: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      throw new ImageNotSupportedError(`Failed to fetch image_url. HTTP ${response.status}.`);
+    }
+
+    const contentTypeHeader = response.headers.get("content-type");
+    const headerMimeType = contentTypeHeader?.split(";")[0]?.trim().toLowerCase() ?? "";
+    const mimeType = isImageMimeType(headerMimeType) ? headerMimeType : inferMimeTypeFromUrl(url);
+    if (!mimeType) {
+      throw new ImageNotSupportedError("Could not determine image_url media type.");
+    }
+
+    const bytes = await readResponseBodyLimited(response, MAX_REMOTE_IMAGE_BYTES);
+    if (bytes.length === 0) {
+      throw new ImageNotSupportedError("image_url resolved to an empty body.");
+    }
+
+    return { mimeType, data: bytes.toString("base64") };
+  } catch (error) {
+    if (error instanceof ImageNotSupportedError) {
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ImageNotSupportedError(`Failed to fetch image_url: ${message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function toPiImageContent(urlValue: string): Promise<{ type: "image"; data: string; mimeType: string }> {
+  const trimmedUrl = urlValue.trim();
+  if (!trimmedUrl) {
+    throw new ImageNotSupportedError("image_url.url must be a non-empty string.");
+  }
+
+  if (trimmedUrl.toLowerCase().startsWith("data:")) {
+    const parsed = parseDataUrl(trimmedUrl);
+    return { type: "image", ...parsed };
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(trimmedUrl);
+  } catch {
+    throw new ImageNotSupportedError("image_url.url must be a valid URL.");
+  }
+
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    throw new ImageNotSupportedError("Only http(s) and data URI image_url values are supported.");
+  }
+
+  const remote = await fetchRemoteImageAsBase64(parsedUrl);
+  return { type: "image", ...remote };
+}
+
+async function userContentToPiContent(
+  content: string | OpenAIContentPart[] | null
+): Promise<string | Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>> {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  const hasImagePart = content.some((part) => part.type === "image_url");
+  if (!hasImagePart) {
+    return asTextContent(content);
+  }
+
+  const parts: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      if (part.text.length > 0) {
+        parts.push({ type: "text", text: part.text });
+      }
+      continue;
+    }
+    const imageUrl = part.image_url?.url;
+    if (typeof imageUrl !== "string") {
+      throw new ImageNotSupportedError("image_url.url must be a string.");
+    }
+    parts.push(await toPiImageContent(imageUrl));
+  }
+
+  return parts;
 }
 
 function parseToolArguments(argumentsText: string): unknown {
@@ -80,7 +257,7 @@ function messageToTool(message: OpenAITool): Record<string, unknown> {
   };
 }
 
-function messageRoleToPiMessage(message: OpenAIMessage): Record<string, unknown> | null {
+async function messageRoleToPiMessage(message: OpenAIMessage): Promise<Record<string, unknown> | null> {
   if (message.role === "system") {
     return null;
   }
@@ -88,7 +265,7 @@ function messageRoleToPiMessage(message: OpenAIMessage): Record<string, unknown>
   if (message.role === "user") {
     return {
       role: "user",
-      content: asTextContent(message.content, false),
+      content: await userContentToPiContent(message.content),
       timestamp: Date.now()
     };
   }
@@ -103,7 +280,7 @@ function messageRoleToPiMessage(message: OpenAIMessage): Record<string, unknown>
       model: "unknown"
     };
 
-    const text = asTextContent(message.content, true);
+    const text = asTextContent(message.content);
     if (text.length > 0) {
       (assistantMessage.content as unknown[]).push({
         type: "text",
@@ -133,7 +310,7 @@ function messageRoleToPiMessage(message: OpenAIMessage): Record<string, unknown>
       content: [
         {
           type: "text",
-          text: asTextContent(message.content, true)
+          text: asTextContent(message.content)
         }
       ],
       isError: false,
@@ -144,7 +321,7 @@ function messageRoleToPiMessage(message: OpenAIMessage): Record<string, unknown>
   return null;
 }
 
-export function openAIRequestToContext(req: OpenAIChatRequest): Record<string, unknown> {
+export async function openAIRequestToContext(req: OpenAIChatRequest): Promise<Record<string, unknown>> {
   const context: Record<string, unknown> = {
     messages: []
   };
@@ -153,14 +330,14 @@ export function openAIRequestToContext(req: OpenAIChatRequest): Record<string, u
 
   for (const message of req.messages) {
     if (message.role === "system") {
-      const text = asTextContent(message.content, true);
+      const text = asTextContent(message.content);
       if (text.length > 0) {
         systemPrompts.push(text);
       }
       continue;
     }
 
-    const converted = messageRoleToPiMessage(message);
+    const converted = await messageRoleToPiMessage(message);
     if (converted) {
       messages.push(converted);
     }

@@ -179,6 +179,29 @@ interface CorrelationResolution {
   traceparent: ParsedTraceparent | null;
 }
 
+interface PayloadPassthroughRule {
+  bodyKeys: string[];
+  payloadKey: string;
+}
+
+const OPENAI_PAYLOAD_PASSTHROUGH_RULES: PayloadPassthroughRule[] = [
+  { bodyKeys: ["top_p", "topP"], payloadKey: "top_p" },
+  { bodyKeys: ["frequency_penalty", "frequencyPenalty"], payloadKey: "frequency_penalty" },
+  { bodyKeys: ["presence_penalty", "presencePenalty"], payloadKey: "presence_penalty" },
+  { bodyKeys: ["seed"], payloadKey: "seed" },
+  { bodyKeys: ["stop"], payloadKey: "stop" },
+  { bodyKeys: ["metadata"], payloadKey: "metadata" },
+  { bodyKeys: ["user"], payloadKey: "user" },
+  { bodyKeys: ["response_format", "responseFormat"], payloadKey: "response_format" },
+  { bodyKeys: ["n"], payloadKey: "n" },
+  { bodyKeys: ["logit_bias", "logitBias"], payloadKey: "logit_bias" },
+  { bodyKeys: ["logprobs"], payloadKey: "logprobs" },
+  { bodyKeys: ["top_logprobs", "topLogprobs"], payloadKey: "top_logprobs" },
+  { bodyKeys: ["parallel_tool_calls", "parallelToolCalls"], payloadKey: "parallel_tool_calls" },
+  { bodyKeys: ["tool_choice", "toolChoice"], payloadKey: "tool_choice" },
+  { bodyKeys: ["max_completion_tokens", "maxCompletionTokens"], payloadKey: "max_output_tokens" }
+];
+
 function firstValidCandidate(maxLength: number, candidates: Candidate[]): ResolvedCandidate | undefined {
   for (const candidate of candidates) {
     const value = normalizeId(candidate.value, maxLength);
@@ -559,6 +582,24 @@ function buildCorrelationHints(
   };
 }
 
+function applyOpenAIParameterPassthrough(payload: unknown, body: OpenAIChatRequest): void {
+  if (!payload || typeof payload !== "object") {
+    return;
+  }
+
+  const payloadRecord = payload as Record<string, unknown>;
+  const bodyRecord = body as Record<string, unknown>;
+
+  for (const rule of OPENAI_PAYLOAD_PASSTHROUGH_RULES) {
+    for (const bodyKey of rule.bodyKeys) {
+      if (bodyRecord[bodyKey] !== undefined) {
+        payloadRecord[rule.payloadKey] = bodyRecord[bodyKey];
+        break;
+      }
+    }
+  }
+}
+
 function isSensitiveHeader(headerName: string): boolean {
   return (
     headerName === "authorization" ||
@@ -760,8 +801,20 @@ function toolMessageContentToObservationOutput(
 }
 
 function extractRecentCompletedToolExecutions(messages: OpenAIChatRequest["messages"]): CompletedToolExecution[] {
+  const lastUserMessageIndex = (() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === "user") {
+        return i;
+      }
+    }
+    return -1;
+  })();
+
+  // Only associate tool activity that happened after the latest user message (current turn).
+  const currentTurnStart = lastUserMessageIndex >= 0 ? lastUserMessageIndex : messages.length;
+
   let lastAssistantWithToolCallsIndex = -1;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
+  for (let i = messages.length - 1; i > currentTurnStart; i -= 1) {
     const message = messages[i];
     if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
       lastAssistantWithToolCallsIndex = i;
@@ -1044,13 +1097,16 @@ async function writeSSEStream(
   streamLike: unknown,
   modelId: string,
   requestId: string,
-  includeUsage: boolean
+  includeUsage: boolean,
+  abortController: AbortController
 ): Promise<{
   emittedAnyOutput: boolean;
   accumulatedText: string;
   streamFinishReason: string | null;
   streamMessage: unknown;
   streamUsage: OpenAIUsage | null;
+  iterationErrorMessage: string | null;
+  clientDisconnected: boolean;
 }> {
   response.statusCode = 200;
   setCorsHeaders(response);
@@ -1063,9 +1119,13 @@ async function writeSSEStream(
   const state = createStreamState(modelId);
   let closed = false;
   let clientDisconnected = false;
+  let iterationErrorMessage: string | null = null;
 
   response.on("close", () => {
     clientDisconnected = true;
+    if (!abortController.signal.aborted) {
+      abortController.abort();
+    }
   });
 
   try {
@@ -1079,11 +1139,19 @@ async function writeSSEStream(
       }
     }
   } catch (error) {
+    iterationErrorMessage = getErrorMessage(error);
+    state.streamFinishReason = state.streamFinishReason ?? "content_filter";
     writeLog("warn", "chat.stream.iteration_error", {
       request_id: requestId,
       model: modelId,
-      message: getErrorMessage(error)
+      message: iterationErrorMessage
     });
+    if (!clientDisconnected && !response.writableEnded) {
+      const errorChunks = eventToSSEChunks({ type: "error", message: iterationErrorMessage }, state);
+      for (const chunk of errorChunks) {
+        response.write(chunk);
+      }
+    }
   } finally {
     if (!closed && !response.writableEnded) {
       if (includeUsage) {
@@ -1103,7 +1171,9 @@ async function writeSSEStream(
     accumulatedText: state.accumulatedText,
     streamFinishReason: state.streamFinishReason,
     streamMessage: state.streamMessage,
-    streamUsage: state.streamUsage
+    streamUsage: state.streamUsage,
+    iterationErrorMessage,
+    clientDisconnected
   };
 }
 
@@ -1186,7 +1256,7 @@ function handleRequestError(response: ServerResponse, error: unknown, requestId:
       400,
       error.message,
       "invalid_request_error",
-      "unknown_model",
+      "model_not_found",
       "warn",
       "request.error.unknown_model"
     );
@@ -1333,17 +1403,36 @@ async function handleChatCompletions(
   const toolContext = summarizeToolContext(body);
   const requestedModelId = body.model;
   const model = resolveCodexModel(requestedModelId);
-  const context = openAIRequestToContext(body);
+  const context = await openAIRequestToContext(body);
   const accessToken = await getAccessToken();
+  const bodyRecord = body as Record<string, unknown>;
+  const maxCompletionTokensCandidate =
+    typeof bodyRecord.max_completion_tokens === "number"
+      ? bodyRecord.max_completion_tokens
+      : typeof bodyRecord.maxCompletionTokens === "number"
+        ? bodyRecord.maxCompletionTokens
+        : undefined;
+  const effectiveMaxTokens = typeof body.max_tokens === "number" ? body.max_tokens : maxCompletionTokensCandidate;
+  const upstreamAbortController = new AbortController();
+  const abortUpstream = (): void => {
+    if (!upstreamAbortController.signal.aborted) {
+      upstreamAbortController.abort();
+    }
+  };
+
+  request.on("aborted", abortUpstream);
+  response.on("close", abortUpstream);
 
   const streamOptions: Record<string, unknown> = {
-    apiKey: accessToken
+    apiKey: accessToken,
+    signal: upstreamAbortController.signal,
+    onPayload: (payload: unknown) => applyOpenAIParameterPassthrough(payload, body)
   };
   if (typeof body.temperature === "number") {
     streamOptions.temperature = body.temperature;
   }
-  if (typeof body.max_tokens === "number") {
-    streamOptions.maxTokens = body.max_tokens;
+  if (typeof effectiveMaxTokens === "number") {
+    streamOptions.maxTokens = effectiveMaxTokens;
   }
 
   writeLog("info", "chat.request.start", {
@@ -1379,7 +1468,10 @@ async function handleChatCompletions(
   const modelParameters: Record<string, number> = {};
   if (typeof body.temperature === "number") modelParameters.temperature = body.temperature;
   if (typeof body.max_tokens === "number") modelParameters.max_tokens = body.max_tokens;
+  if (typeof maxCompletionTokensCandidate === "number") modelParameters.max_completion_tokens = maxCompletionTokensCandidate;
   if (typeof body.top_p === "number") modelParameters.top_p = body.top_p;
+  if (typeof body.frequency_penalty === "number") modelParameters.frequency_penalty = body.frequency_penalty;
+  if (typeof body.presence_penalty === "number") modelParameters.presence_penalty = body.presence_penalty;
 
   const runWithRootObservation = async (rootObservation: LangfuseSpan | LangfuseAgent): Promise<void> => {
     const executeCompletion = async (): Promise<void> => {
@@ -1431,13 +1523,20 @@ async function handleChatCompletions(
           eventStream,
           requestedModelId,
           requestId,
-          body.stream_options?.include_usage === true
+          body.stream_options?.include_usage === true,
+          upstreamAbortController
         );
-        const streamOutput = streamOutcome.accumulatedText || streamOutcome.streamMessage;
+        // Prefer structured stream message to preserve tool-call payloads for tracing.
+        const streamOutput = streamOutcome.streamMessage ?? streamOutcome.accumulatedText;
         const requestedToolCalls = extractToolCallsFromUnknown(streamOutcome.streamMessage);
         if (requestedToolCalls.length > 0) {
           emitRequestedToolCallObservations(generation, requestedToolCalls);
         }
+        const streamFailureMessage = streamOutcome.clientDisconnected
+          ? "Client disconnected before stream completion."
+          : streamOutcome.iterationErrorMessage
+            ? `Streaming interrupted: ${streamOutcome.iterationErrorMessage}`
+            : null;
         generation
           .update({
             output: streamOutput,
@@ -1450,21 +1549,43 @@ async function handleChatCompletions(
                   }
                 }
               : {}),
-            ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {})
+            ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {}),
+            ...(streamFailureMessage ? { level: "ERROR", statusMessage: streamFailureMessage } : {})
           })
           .end();
 
-        rootObservation.update({ output: streamOutput });
+        if (streamFailureMessage) {
+          rootObservation.update({
+            output: streamOutput,
+            level: "ERROR",
+            statusMessage: streamFailureMessage
+          });
+        } else {
+          rootObservation.update({ output: streamOutput });
+        }
         rootObservation.updateTrace({ output: streamOutput });
-        writeLog("info", "chat.request.complete", {
-          request_id: requestId,
-          model: requestedModelId,
-          stream: true,
-          status_code: response.statusCode,
-          duration_ms: Date.now() - startedAt,
-          emitted_output: streamOutcome.emittedAnyOutput,
-          tool_calls_requested: requestedToolCalls.length
-        });
+        if (streamFailureMessage) {
+          writeLog("warn", "chat.request.stream_incomplete", {
+            request_id: requestId,
+            model: requestedModelId,
+            stream: true,
+            status_code: response.statusCode,
+            duration_ms: Date.now() - startedAt,
+            emitted_output: streamOutcome.emittedAnyOutput,
+            tool_calls_requested: requestedToolCalls.length,
+            message: streamFailureMessage
+          });
+        } else {
+          writeLog("info", "chat.request.complete", {
+            request_id: requestId,
+            model: requestedModelId,
+            stream: true,
+            status_code: response.statusCode,
+            duration_ms: Date.now() - startedAt,
+            emitted_output: streamOutcome.emittedAnyOutput,
+            tool_calls_requested: requestedToolCalls.length
+          });
+        }
         return;
       }
 
@@ -1536,20 +1657,25 @@ async function handleChatCompletions(
 
   const startContext = parentSpanContext ? { parentSpanContext } : undefined;
 
-  if (toolContext.isAgentic) {
-    if (startContext) {
-      await startActiveObservation("chat.turn.agent", runWithRootObservation, { ...startContext, asType: "agent" });
+  try {
+    if (toolContext.isAgentic) {
+      if (startContext) {
+        await startActiveObservation("chat.turn.agent", runWithRootObservation, { ...startContext, asType: "agent" });
+        return;
+      }
+      await startActiveObservation("chat.turn.agent", runWithRootObservation, { asType: "agent" });
       return;
     }
-    await startActiveObservation("chat.turn.agent", runWithRootObservation, { asType: "agent" });
-    return;
-  }
 
-  if (startContext) {
-    await startActiveObservation("chat.turn", runWithRootObservation, startContext);
-    return;
+    if (startContext) {
+      await startActiveObservation("chat.turn", runWithRootObservation, startContext);
+      return;
+    }
+    await startActiveObservation("chat.turn", runWithRootObservation);
+  } finally {
+    request.off("aborted", abortUpstream);
+    response.off("close", abortUpstream);
   }
-  await startActiveObservation("chat.turn", runWithRootObservation);
 }
 
 export async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -1585,6 +1711,7 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
     }
 
     if (method === "GET" && pathname === "/v1/models") {
+      validateApiKeyHeader(request);
       await handleModels(response, requestId);
       writeLog("info", "request.complete", {
         request_id: requestId,
