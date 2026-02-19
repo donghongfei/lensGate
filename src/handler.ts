@@ -1,9 +1,16 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import { streamSimple } from "@mariozechner/pi-ai";
-import { createTraceId, propagateAttributes, startActiveObservation, startObservation } from "@langfuse/tracing";
+import {
+  createTraceId,
+  propagateAttributes,
+  startActiveObservation,
+  startObservation,
+  type LangfuseAgent,
+  type LangfuseSpan
+} from "@langfuse/tracing";
 import { getAccessToken, NotLoggedInError } from "./auth.js";
-import { BODY_LIMIT_BYTES, CORS_ALLOW_ORIGIN, LOG_LEVEL, PROXY_API_KEY } from "./config.js";
+import { BODY_LIMIT_BYTES, CORS_ALLOW_ORIGIN, LOG_CHAT_PAYLOAD, LOG_LEVEL, PROXY_API_KEY } from "./config.js";
 import {
   assistantMessageToResponse,
   createStreamState,
@@ -14,7 +21,13 @@ import {
   openAIRequestToContext
 } from "./convert.js";
 import { getAllCodexModels, modelIdFromUnknown, resolveCodexModel, UnknownModelError } from "./models.js";
-import type { OpenAIChatRequest, OpenAIErrorResponse, OpenAIModelObject, OpenAIModelsResponse } from "./types.js";
+import type {
+  OpenAIChatRequest,
+  OpenAIErrorResponse,
+  OpenAIModelObject,
+  OpenAIModelsResponse,
+  OpenAIUsage
+} from "./types.js";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -120,46 +133,121 @@ function getRequestId(request: IncomingMessage): string {
   return `req_${randomBytes(8).toString("hex")}`;
 }
 
-function firstValidId(maxLength: number, ...candidates: unknown[]): string | undefined {
-  for (const candidate of candidates) {
-    const value = normalizeId(candidate, maxLength);
-    if (value) {
-      return value;
-    }
-  }
-  return undefined;
+interface Candidate {
+  source: string;
+  value: unknown;
 }
 
-function getSessionId(request: IncomingMessage, body: OpenAIChatRequest): string | undefined {
-  const bodyRecord = body as Record<string, unknown>;
-  return firstValidId(
-    200,
-    bodyRecord.session_id,
-    bodyRecord.sessionId,
-    bodyRecord.conversation_id,
-    bodyRecord.conversationId,
-    bodyRecord.thread_id,
-    bodyRecord.threadId,
-    readHeaderString(request, "x-session-id", 200),
-    readHeaderString(request, "x-conversation-id", 200),
-    readHeaderString(request, "x-thread-id", 200)
-  );
-}
-
-function getUserId(request: IncomingMessage, body: OpenAIChatRequest): string | undefined {
-  const bodyRecord = body as Record<string, unknown>;
-  return firstValidId(
-    200,
-    bodyRecord.user,
-    bodyRecord.user_id,
-    bodyRecord.userId,
-    readHeaderString(request, "x-user-id", 200)
-  );
+interface ResolvedCandidate {
+  source: string;
+  value: string;
 }
 
 interface ConversationInfo {
   sender?: string;
   messageId?: string;
+  sessionId?: string;
+  turnId?: string;
+  traceId?: string;
+}
+
+interface ParsedTraceparent {
+  traceId: string;
+  spanId: string;
+  traceFlags: number;
+}
+
+interface ParentSpanContext {
+  traceId: string;
+  spanId: string;
+  traceFlags: number;
+}
+
+interface CorrelationResolution {
+  sessionId?: string;
+  userId?: string;
+  turnId?: string;
+  traceId?: string;
+  parentSpanContext?: ParentSpanContext;
+  sources: {
+    sessionId?: string;
+    userId?: string;
+    turnId?: string;
+    traceId?: string;
+  };
+  conversationInfo: ConversationInfo;
+  traceparent: ParsedTraceparent | null;
+}
+
+function firstValidCandidate(maxLength: number, candidates: Candidate[]): ResolvedCandidate | undefined {
+  for (const candidate of candidates) {
+    const value = normalizeId(candidate.value, maxLength);
+    if (value) {
+      return { source: candidate.source, value };
+    }
+  }
+  return undefined;
+}
+
+function normalizeHex(value: string, length: number, options?: { allowAllZero?: boolean }): string | null {
+  const normalized = value.trim().toLowerCase();
+  if (normalized.length !== length) {
+    return null;
+  }
+  if (!/^[0-9a-f]+$/.test(normalized)) {
+    return null;
+  }
+  if (!options?.allowAllZero && /^0+$/.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function normalizeTraceId(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  return normalizeHex(value, 32);
+}
+
+function normalizeSpanId(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  return normalizeHex(value, 16);
+}
+
+function parseTraceparent(value: string | null): ParsedTraceparent | null {
+  if (!value) {
+    return null;
+  }
+
+  const parts = value.trim().split("-");
+  if (parts.length !== 4) {
+    return null;
+  }
+
+  const version = normalizeHex(parts[0], 2, { allowAllZero: true });
+  const traceId = normalizeHex(parts[1], 32);
+  const spanId = normalizeSpanId(parts[2]);
+  const traceFlagsHex = parts[3].trim().toLowerCase();
+  if (!version || version === "ff" || !traceId || !spanId || !/^[0-9a-f]{2}$/.test(traceFlagsHex)) {
+    return null;
+  }
+
+  return {
+    traceId,
+    spanId,
+    traceFlags: Number.parseInt(traceFlagsHex, 16)
+  };
+}
+
+function buildSyntheticParentSpanContext(traceId: string): ParentSpanContext {
+  return {
+    traceId,
+    spanId: randomBytes(8).toString("hex"),
+    traceFlags: 1
+  };
 }
 
 function textFromMessageContent(content: OpenAIChatRequest["messages"][number]["content"]): string {
@@ -183,7 +271,27 @@ function parseConversationInfoObject(candidate: unknown): ConversationInfo {
   const record = candidate as Record<string, unknown>;
   const sender = firstValidId(200, record.sender, record.sender_id, record.senderId, record.user_id, record.userId);
   const messageId = firstValidId(200, record.message_id, record.messageId, record.id);
-  return { sender, messageId };
+  const sessionId = firstValidCandidate(200, [
+    { source: "conversation_info.session_id", value: record.session_id },
+    { source: "conversation_info.sessionId", value: record.sessionId },
+    { source: "conversation_info.conversation_id", value: record.conversation_id },
+    { source: "conversation_info.conversationId", value: record.conversationId },
+    { source: "conversation_info.thread_id", value: record.thread_id },
+    { source: "conversation_info.threadId", value: record.threadId }
+  ])?.value;
+  const turnId = firstValidCandidate(200, [
+    { source: "conversation_info.turn_id", value: record.turn_id },
+    { source: "conversation_info.turnId", value: record.turnId },
+    { source: "conversation_info.workflow_id", value: record.workflow_id },
+    { source: "conversation_info.workflowId", value: record.workflowId },
+    { source: "conversation_info.chat_id", value: record.chat_id },
+    { source: "conversation_info.chatId", value: record.chatId }
+  ])?.value;
+  const traceId = firstValidCandidate(256, [
+    { source: "conversation_info.trace_id", value: record.trace_id },
+    { source: "conversation_info.traceId", value: record.traceId }
+  ])?.value;
+  return { sender, messageId, sessionId, turnId, traceId };
 }
 
 function extractConversationInfoFromText(text: string): ConversationInfo {
@@ -205,7 +313,16 @@ function extractConversationInfoFromText(text: string): ConversationInfo {
       if (info.messageId && !result.messageId) {
         result.messageId = info.messageId;
       }
-      if (result.sender && result.messageId) {
+      if (info.sessionId && !result.sessionId) {
+        result.sessionId = info.sessionId;
+      }
+      if (info.turnId && !result.turnId) {
+        result.turnId = info.turnId;
+      }
+      if (info.traceId && !result.traceId) {
+        result.traceId = info.traceId;
+      }
+      if (result.sender && result.messageId && result.sessionId && result.turnId && result.traceId) {
         return result;
       }
     } catch {
@@ -225,6 +342,26 @@ function extractConversationInfoFromText(text: string): ConversationInfo {
       result.messageId = normalizeId(messageIdMatch[1], 200) ?? undefined;
     }
   }
+  if (!result.sessionId) {
+    const sessionIdMatch = text.match(
+      /"(session_id|sessionId|conversation_id|conversationId|thread_id|threadId)"\s*:\s*"([^"]+)"/
+    );
+    if (sessionIdMatch) {
+      result.sessionId = normalizeId(sessionIdMatch[2], 200) ?? undefined;
+    }
+  }
+  if (!result.turnId) {
+    const turnIdMatch = text.match(/"(turn_id|turnId|workflow_id|workflowId|chat_id|chatId)"\s*:\s*"([^"]+)"/);
+    if (turnIdMatch) {
+      result.turnId = normalizeId(turnIdMatch[2], 200) ?? undefined;
+    }
+  }
+  if (!result.traceId) {
+    const traceIdMatch = text.match(/"(trace_id|traceId)"\s*:\s*"([^"]+)"/);
+    if (traceIdMatch) {
+      result.traceId = normalizeId(traceIdMatch[2], 256) ?? undefined;
+    }
+  }
 
   return result;
 }
@@ -237,35 +374,124 @@ function extractConversationInfoFromMessages(messages: OpenAIChatRequest["messag
     }
     const text = textFromMessageContent(message.content);
     const info = extractConversationInfoFromText(text);
-    if (info.sender || info.messageId) {
+    if (info.sender || info.messageId || info.sessionId || info.turnId || info.traceId) {
       return info;
     }
   }
   return {};
 }
 
-function getTurnId(request: IncomingMessage, body: OpenAIChatRequest): string | undefined {
+function firstValidId(maxLength: number, ...candidates: unknown[]): string | undefined {
+  return firstValidCandidate(
+    maxLength,
+    candidates.map((value, index) => ({ source: `candidate_${index}`, value }))
+  )?.value;
+}
+
+async function resolveCorrelationContext(
+  request: IncomingMessage,
+  body: OpenAIChatRequest
+): Promise<CorrelationResolution> {
   const bodyRecord = body as Record<string, unknown>;
-  return firstValidId(
-    200,
-    bodyRecord.turn_id,
-    bodyRecord.turnId,
-    bodyRecord.workflow_id,
-    bodyRecord.workflowId,
-    bodyRecord.chat_id,
-    bodyRecord.chatId,
-    readHeaderString(request, "x-turn-id", 200),
-    readHeaderString(request, "x-workflow-id", 200),
-    readHeaderString(request, "x-chat-id", 200),
-    readHeaderString(request, "x-correlation-id", 200),
-    readHeaderString(request, "x-trace-id", 200)
-  );
+  const conversationInfo = extractConversationInfoFromMessages(body.messages);
+
+  const sessionCandidate = firstValidCandidate(200, [
+    { source: "body.session_id", value: bodyRecord.session_id },
+    { source: "body.sessionId", value: bodyRecord.sessionId },
+    { source: "body.conversation_id", value: bodyRecord.conversation_id },
+    { source: "body.conversationId", value: bodyRecord.conversationId },
+    { source: "body.thread_id", value: bodyRecord.thread_id },
+    { source: "body.threadId", value: bodyRecord.threadId },
+    { source: "header.x-session-id", value: readHeaderString(request, "x-session-id", 200) },
+    { source: "header.x-conversation-id", value: readHeaderString(request, "x-conversation-id", 200) },
+    { source: "header.x-thread-id", value: readHeaderString(request, "x-thread-id", 200) },
+    { source: "conversation_info.session_id", value: conversationInfo.sessionId }
+  ]);
+
+  const userCandidate = firstValidCandidate(200, [
+    { source: "body.user", value: bodyRecord.user },
+    { source: "body.user_id", value: bodyRecord.user_id },
+    { source: "body.userId", value: bodyRecord.userId },
+    { source: "header.x-user-id", value: readHeaderString(request, "x-user-id", 200) },
+    { source: "conversation_info.sender", value: conversationInfo.sender }
+  ]);
+
+  const turnCandidate = firstValidCandidate(200, [
+    { source: "body.turn_id", value: bodyRecord.turn_id },
+    { source: "body.turnId", value: bodyRecord.turnId },
+    { source: "body.workflow_id", value: bodyRecord.workflow_id },
+    { source: "body.workflowId", value: bodyRecord.workflowId },
+    { source: "body.chat_id", value: bodyRecord.chat_id },
+    { source: "body.chatId", value: bodyRecord.chatId },
+    { source: "header.x-turn-id", value: readHeaderString(request, "x-turn-id", 200) },
+    { source: "header.x-workflow-id", value: readHeaderString(request, "x-workflow-id", 200) },
+    { source: "header.x-chat-id", value: readHeaderString(request, "x-chat-id", 200) },
+    { source: "header.x-correlation-id", value: readHeaderString(request, "x-correlation-id", 200) },
+    { source: "conversation_info.turn_id", value: conversationInfo.turnId },
+    {
+      source: "conversation_info.sender_message_id",
+      value:
+        conversationInfo.sender && conversationInfo.messageId
+          ? `${conversationInfo.sender}:${conversationInfo.messageId}`
+          : undefined
+    },
+    { source: "conversation_info.message_id", value: conversationInfo.messageId }
+  ]);
+
+  const traceparent = parseTraceparent(readHeaderString(request, "traceparent", 512));
+  const explicitTraceCandidate = firstValidCandidate(256, [
+    { source: "body.trace_id", value: bodyRecord.trace_id },
+    { source: "body.traceId", value: bodyRecord.traceId },
+    { source: "header.x-trace-id", value: readHeaderString(request, "x-trace-id", 256) },
+    { source: "conversation_info.trace_id", value: conversationInfo.traceId }
+  ]);
+
+  let traceId: string | undefined;
+  let traceSource: string | undefined;
+  let parentSpanContext: ParentSpanContext | undefined;
+
+  if (traceparent) {
+    traceId = traceparent.traceId;
+    traceSource = "header.traceparent";
+    parentSpanContext = {
+      traceId: traceparent.traceId,
+      spanId: traceparent.spanId,
+      traceFlags: traceparent.traceFlags
+    };
+  } else if (explicitTraceCandidate) {
+    const normalizedProvidedTraceId = normalizeTraceId(explicitTraceCandidate.value);
+    traceId = normalizedProvidedTraceId ?? (await createTraceId(`trace:${explicitTraceCandidate.value}`));
+    traceSource = normalizedProvidedTraceId
+      ? explicitTraceCandidate.source
+      : `${explicitTraceCandidate.source}:seed`;
+    parentSpanContext = buildSyntheticParentSpanContext(traceId);
+  } else if (turnCandidate?.value) {
+    traceId = await createTraceId(`turn:${turnCandidate.value}`);
+    traceSource = `${turnCandidate.source}:derived_trace`;
+    parentSpanContext = buildSyntheticParentSpanContext(traceId);
+  }
+
+  return {
+    sessionId: sessionCandidate?.value,
+    userId: userCandidate?.value,
+    turnId: turnCandidate?.value,
+    traceId,
+    parentSpanContext,
+    sources: {
+      sessionId: sessionCandidate?.source,
+      userId: userCandidate?.source,
+      turnId: turnCandidate?.source,
+      traceId: traceSource
+    },
+    conversationInfo,
+    traceparent
+  };
 }
 
 function buildCorrelationHints(
   request: IncomingMessage,
   body: OpenAIChatRequest,
-  derived: { sessionId?: string; userId?: string; turnId?: string; traceId?: string; conversationInfo?: ConversationInfo }
+  correlation: CorrelationResolution
 ): Record<string, unknown> {
   const bodyRecord = body as Record<string, unknown>;
 
@@ -290,6 +516,8 @@ function buildCorrelationHints(
       workflowId: normalizeId(bodyRecord.workflowId, 200),
       chat_id: normalizeId(bodyRecord.chat_id, 200),
       chatId: normalizeId(bodyRecord.chatId, 200),
+      trace_id: normalizeId(bodyRecord.trace_id, 256),
+      traceId: normalizeId(bodyRecord.traceId, 256),
       user: normalizeId(bodyRecord.user, 200),
       user_id: normalizeId(bodyRecord.user_id, 200),
       userId: normalizeId(bodyRecord.userId, 200)
@@ -309,14 +537,24 @@ function buildCorrelationHints(
       baggage: readHeaderString(request, "baggage", 512)
     },
     derived: {
-      session_id: derived.sessionId ?? null,
-      user_id: derived.userId ?? null,
-      turn_id: derived.turnId ?? null,
-      trace_id: derived.traceId ?? null,
+      session_id: correlation.sessionId ?? null,
+      user_id: correlation.userId ?? null,
+      turn_id: correlation.turnId ?? null,
+      trace_id: correlation.traceId ?? null,
+      source: {
+        session_id: correlation.sources.sessionId ?? null,
+        user_id: correlation.sources.userId ?? null,
+        turn_id: correlation.sources.turnId ?? null,
+        trace_id: correlation.sources.traceId ?? null
+      },
       conversation_info: {
-        sender: derived.conversationInfo?.sender ?? null,
-        message_id: derived.conversationInfo?.messageId ?? null
-      }
+        sender: correlation.conversationInfo.sender ?? null,
+        message_id: correlation.conversationInfo.messageId ?? null,
+        session_id: correlation.conversationInfo.sessionId ?? null,
+        turn_id: correlation.conversationInfo.turnId ?? null,
+        trace_id: correlation.conversationInfo.traceId ?? null
+      },
+      traceparent: correlation.traceparent ?? null
     }
   };
 }
@@ -397,6 +635,143 @@ function buildRequestHeadersForLog(request: IncomingMessage): Record<string, unk
     headers[key] = sanitizeForLog(value);
   }
   return headers;
+}
+
+interface ToolContextSummary {
+  advertisedTools: number;
+  assistantToolCallsInInput: number;
+  toolMessagesInInput: number;
+  isAgentic: boolean;
+}
+
+interface NormalizedToolCall {
+  id: string;
+  name: string;
+  argumentsText: string;
+}
+
+type ObservationWithChildren = Pick<LangfuseSpan, "startObservation">;
+
+function stringifyToolCallArguments(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === undefined || value === null) {
+    return "";
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function extractToolCallsFromUnknown(message: unknown): NormalizedToolCall[] {
+  if (!message || typeof message !== "object") {
+    return [];
+  }
+
+  const record = message as Record<string, unknown>;
+  const structuredCalls =
+    (Array.isArray(record.toolCalls) ? record.toolCalls : null) ??
+    (Array.isArray(record.tool_calls) ? record.tool_calls : null) ??
+    [];
+  const contentCalls = Array.isArray(record.content)
+    ? record.content.filter(
+        (item): item is Record<string, unknown> =>
+          Boolean(item) && typeof item === "object" && (item as Record<string, unknown>).type === "toolCall"
+      )
+    : [];
+  const source = structuredCalls.length > 0 ? structuredCalls : contentCalls;
+
+  const calls: NormalizedToolCall[] = [];
+  for (let i = 0; i < source.length; i += 1) {
+    const item = source[i];
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const itemRecord = item as Record<string, unknown>;
+    const functionRecord =
+      itemRecord.function && typeof itemRecord.function === "object"
+        ? (itemRecord.function as Record<string, unknown>)
+        : undefined;
+
+    const id =
+      normalizeId(itemRecord.id, 200) ??
+      normalizeId(itemRecord.toolCallId, 200) ??
+      normalizeId(functionRecord?.id, 200) ??
+      `call_${i}`;
+    const name =
+      normalizeId(itemRecord.name, 200) ??
+      normalizeId(itemRecord.toolName, 200) ??
+      normalizeId(functionRecord?.name, 200) ??
+      "tool";
+    const argumentsText = stringifyToolCallArguments(
+      itemRecord.arguments ?? functionRecord?.arguments ?? itemRecord.input ?? ""
+    );
+
+    calls.push({
+      id,
+      name,
+      argumentsText
+    });
+  }
+
+  return calls;
+}
+
+function parseToolArgumentsForObservation(argumentsText: string): unknown {
+  const input = argumentsText.trim();
+  if (!input) {
+    return {};
+  }
+  try {
+    return JSON.parse(input);
+  } catch {
+    return { raw: argumentsText };
+  }
+}
+
+function emitRequestedToolCallObservations(parent: ObservationWithChildren, toolCalls: NormalizedToolCall[]): void {
+  for (const toolCall of toolCalls) {
+    const toolObservation = parent.startObservation(
+      `tool.${toolCall.name}`,
+      {
+        input: parseToolArgumentsForObservation(toolCall.argumentsText),
+        metadata: {
+          toolCallId: toolCall.id,
+          phase: "model_requested"
+        },
+        statusMessage: "Tool call requested by model. Runtime executes this tool outside the proxy."
+      },
+      { asType: "tool" }
+    );
+    toolObservation.end();
+  }
+}
+
+function summarizeToolContext(body: OpenAIChatRequest): ToolContextSummary {
+  let assistantToolCallsInInput = 0;
+  let toolMessagesInInput = 0;
+
+  for (const message of body.messages) {
+    if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
+      assistantToolCallsInInput += message.tool_calls.length;
+    }
+    if (message.role === "tool") {
+      toolMessagesInInput += 1;
+    }
+  }
+
+  const advertisedTools = Array.isArray(body.tools) ? body.tools.length : 0;
+  const isAgentic = advertisedTools > 0 || assistantToolCallsInInput > 0 || toolMessagesInInput > 0;
+
+  return {
+    advertisedTools,
+    assistantToolCallsInInput,
+    toolMessagesInInput,
+    isAgentic
+  };
 }
 
 function setCorsHeaders(response: ServerResponse): void {
@@ -560,7 +935,13 @@ async function writeSSEStream(
   modelId: string,
   requestId: string,
   includeUsage: boolean
-): Promise<{ emittedAnyOutput: boolean; accumulatedText: string; streamFinishReason: string | null; streamMessage: unknown }> {
+): Promise<{
+  emittedAnyOutput: boolean;
+  accumulatedText: string;
+  streamFinishReason: string | null;
+  streamMessage: unknown;
+  streamUsage: OpenAIUsage | null;
+}> {
   response.statusCode = 200;
   setCorsHeaders(response);
   response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -607,7 +988,13 @@ async function writeSSEStream(
     }
   }
 
-  return { emittedAnyOutput: state.emittedAnyOutput, accumulatedText: state.accumulatedText, streamFinishReason: state.streamFinishReason, streamMessage: state.streamMessage };
+  return {
+    emittedAnyOutput: state.emittedAnyOutput,
+    accumulatedText: state.accumulatedText,
+    streamFinishReason: state.streamFinishReason,
+    streamMessage: state.streamMessage,
+    streamUsage: state.streamUsage
+  };
 }
 
 function toOpenAIModelObject(model: unknown): OpenAIModelObject {
@@ -831,18 +1218,9 @@ async function handleChatCompletions(
   validateApiKeyHeader(request);
 
   const body = await parseChatRequest(request);
-  const conversationInfo = extractConversationInfoFromMessages(body.messages);
-  const inferredSessionId = conversationInfo.sender;
-  const inferredTurnId = firstValidId(
-    200,
-    conversationInfo.sender && conversationInfo.messageId ? `${conversationInfo.sender}:${conversationInfo.messageId}` : undefined,
-    conversationInfo.messageId
-  );
-
-  const sessionId = getSessionId(request, body) ?? inferredSessionId;
-  const userId = getUserId(request, body) ?? conversationInfo.sender;
-  const turnId = getTurnId(request, body) ?? inferredTurnId;
-  const traceId = turnId ? await createTraceId(`turn:${turnId}`) : undefined;
+  const correlation = await resolveCorrelationContext(request, body);
+  const { sessionId, userId, turnId, traceId, parentSpanContext } = correlation;
+  const toolContext = summarizeToolContext(body);
   const requestedModelId = body.model;
   const model = resolveCodexModel(requestedModelId);
   const context = openAIRequestToContext(body);
@@ -865,41 +1243,60 @@ async function handleChatCompletions(
     session_id: sessionId ?? null,
     user_id: userId ?? null,
     turn_id: turnId ?? null,
-    trace_id: traceId ?? null
+    trace_id: traceId ?? null,
+    source: {
+      session_id: correlation.sources.sessionId ?? null,
+      user_id: correlation.sources.userId ?? null,
+      turn_id: correlation.sources.turnId ?? null,
+      trace_id: correlation.sources.traceId ?? null
+    },
+    tool_context: toolContext
   });
 
   writeLog("info", "chat.request.correlation_hints", {
     request_id: requestId,
-    ...buildCorrelationHints(request, body, { sessionId, userId, turnId, traceId, conversationInfo })
+    ...buildCorrelationHints(request, body, correlation)
   });
 
-  writeLog("info", "chat.request.payload", {
-    request_id: requestId,
-    headers: buildRequestHeadersForLog(request),
-    body: sanitizeForLog(body)
-  });
+  if (LOG_CHAT_PAYLOAD) {
+    writeLog("info", "chat.request.payload", {
+      request_id: requestId,
+      headers: buildRequestHeadersForLog(request),
+      body: sanitizeForLog(body)
+    });
+  }
 
   const modelParameters: Record<string, number> = {};
   if (typeof body.temperature === "number") modelParameters.temperature = body.temperature;
   if (typeof body.max_tokens === "number") modelParameters.max_tokens = body.max_tokens;
   if (typeof body.top_p === "number") modelParameters.top_p = body.top_p;
 
-  const runChatObservation = async (): Promise<void> => {
-    await startActiveObservation("chat", async (trace) => {
-      const executeCompletion = async (): Promise<void> => {
-        trace.updateTrace({
-          ...(sessionId ? { sessionId } : {}),
-          ...(userId ? { userId } : {}),
-          input: { messages: body.messages },
-          metadata: {
-            model: body.model,
-            stream: body.stream === true,
-            requestId,
-            turnId: turnId ?? null,
-            traceId: traceId ?? null
-          }
-        });
-        trace.update({ input: { messages: body.messages } });
+  const runWithRootObservation = async (rootObservation: LangfuseSpan | LangfuseAgent): Promise<void> => {
+    const executeCompletion = async (): Promise<void> => {
+      rootObservation.updateTrace({
+        name: toolContext.isAgentic ? "openai.chat.agent_turn" : "openai.chat.turn",
+        ...(sessionId ? { sessionId } : {}),
+        ...(userId ? { userId } : {}),
+        tags: toolContext.isAgentic
+          ? ["openai-proxy", "chat.completions", "agentic"]
+          : ["openai-proxy", "chat.completions"],
+        input: { messages: body.messages },
+        metadata: {
+          model: body.model,
+          stream: body.stream === true,
+          requestId,
+          turnId: turnId ?? null,
+          traceId: traceId ?? null,
+          correlation: {
+            sessionSource: correlation.sources.sessionId ?? null,
+            userSource: correlation.sources.userId ?? null,
+            turnSource: correlation.sources.turnId ?? null,
+            traceSource: correlation.sources.traceId ?? null
+          },
+          toolContext
+        }
+      });
+      rootObservation.update({ input: { messages: body.messages } });
 
       const generation = startObservation(
         "chat_completion",
@@ -914,20 +1311,44 @@ async function handleChatCompletions(
       const eventStream = streamSimple(model as never, context as never, streamOptions as never);
 
       if (body.stream === true) {
-        const streamOutcome = await writeSSEStream(response, eventStream, requestedModelId, requestId, body.stream_options?.include_usage === true);
-        const streamOutput = streamOutcome.accumulatedText || streamOutcome.streamMessage;
-        generation.update({
-          output: streamOutput,
-          ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {})
-        }).end();
-        trace.update({ output: streamOutput });
+        const streamOutcome = await writeSSEStream(
+          response,
+          eventStream,
+          requestedModelId,
+          requestId,
+          body.stream_options?.include_usage === true
+        );
+        const streamOutput = streamOutcome.streamMessage ?? streamOutcome.accumulatedText;
+        generation
+          .update({
+            output: streamOutput,
+            ...(streamOutcome.streamUsage
+              ? {
+                  usageDetails: {
+                    input: streamOutcome.streamUsage.prompt_tokens,
+                    output: streamOutcome.streamUsage.completion_tokens,
+                    total: streamOutcome.streamUsage.total_tokens
+                  }
+                }
+              : {}),
+            ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {})
+          })
+          .end();
+
+        const requestedToolCalls = extractToolCallsFromUnknown(streamOutcome.streamMessage);
+        if (requestedToolCalls.length > 0) {
+          emitRequestedToolCallObservations(generation, requestedToolCalls);
+        }
+
+        rootObservation.update({ output: streamOutput });
         writeLog("info", "chat.request.complete", {
           request_id: requestId,
           model: requestedModelId,
           stream: true,
           status_code: response.statusCode,
           duration_ms: Date.now() - startedAt,
-          emitted_output: streamOutcome.emittedAnyOutput
+          emitted_output: streamOutcome.emittedAnyOutput,
+          tool_calls_requested: requestedToolCalls.length
         });
         return;
       }
@@ -950,16 +1371,24 @@ async function handleChatCompletions(
       sendJson(response, 200, responseBody);
 
       const responseMessage = responseBody.choices[0]?.message;
-      generation.update({
-        output: responseMessage,
-        usageDetails: {
-          input: responseBody.usage.prompt_tokens,
-          output: responseBody.usage.completion_tokens,
-          total: responseBody.usage.total_tokens
-        },
-        ...(responseBody.choices[0]?.finish_reason ? { metadata: { finishReason: responseBody.choices[0].finish_reason } } : {})
-      }).end();
-      trace.update({ output: responseMessage });
+      generation
+        .update({
+          output: responseMessage,
+          usageDetails: {
+            input: responseBody.usage.prompt_tokens,
+            output: responseBody.usage.completion_tokens,
+            total: responseBody.usage.total_tokens
+          },
+          ...(responseBody.choices[0]?.finish_reason ? { metadata: { finishReason: responseBody.choices[0].finish_reason } } : {})
+        })
+        .end();
+
+      const requestedToolCalls = extractToolCallsFromUnknown(responseMessage);
+      if (requestedToolCalls.length > 0) {
+        emitRequestedToolCallObservations(generation, requestedToolCalls);
+      }
+
+      rootObservation.update({ output: responseMessage });
 
       writeLog("info", "chat.request.complete", {
         request_id: requestId,
@@ -969,7 +1398,8 @@ async function handleChatCompletions(
         duration_ms: Date.now() - startedAt,
         finish_reason: responseBody.choices[0]?.finish_reason ?? null,
         prompt_tokens: responseBody.usage.prompt_tokens,
-        completion_tokens: responseBody.usage.completion_tokens
+        completion_tokens: responseBody.usage.completion_tokens,
+        tool_calls_requested: requestedToolCalls.length
       });
     };
 
@@ -987,10 +1417,24 @@ async function handleChatCompletions(
         await executeCompletion();
       }
     );
-    }, traceId ? { parentSpanContext: { traceId, spanId: randomBytes(8).toString("hex"), traceFlags: 1 } } : undefined);
   };
 
-  await runChatObservation();
+  const startContext = parentSpanContext ? { parentSpanContext } : undefined;
+
+  if (toolContext.isAgentic) {
+    if (startContext) {
+      await startActiveObservation("chat.turn.agent", runWithRootObservation, { ...startContext, asType: "agent" });
+      return;
+    }
+    await startActiveObservation("chat.turn.agent", runWithRootObservation, { asType: "agent" });
+    return;
+  }
+
+  if (startContext) {
+    await startActiveObservation("chat.turn", runWithRootObservation, startContext);
+    return;
+  }
+  await startActiveObservation("chat.turn", runWithRootObservation);
 }
 
 export async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {

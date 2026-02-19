@@ -1,6 +1,14 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
 /** Token 文件路径，默认 ~/.lensgate/agent/auth.json */
 export const AUTH_STORAGE_PATH =
   process.env.AUTH_STORAGE_PATH ?? join(homedir(), ".lensgate", "agent", "auth.json");
@@ -19,6 +27,9 @@ export const CORS_ALLOW_ORIGIN = process.env.CORS_ALLOW_ORIGIN ?? "*";
 
 /** 日志级别，默认 info */
 export const LOG_LEVEL = process.env.LOG_LEVEL ?? "info";
+
+/** 是否记录完整 chat 请求 payload（默认 false，仅排障时建议开启） */
+export const LOG_CHAT_PAYLOAD = parseBooleanEnv(process.env.LOG_CHAT_PAYLOAD, false);
 
 /**
  * 可选：限制访问代理的 API Key。

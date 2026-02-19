@@ -34,7 +34,15 @@ Default server address:
 
 - `HOST` default `127.0.0.1`
 - `PORT` default `3000`
-- `BODY_LIMIT_BYTES` default `1048576` (1 MiB)
+- `BODY_LIMIT_BYTES` default `4194304` (4 MiB)
 - `CORS_ALLOW_ORIGIN` default `*`
 - `PROXY_API_KEY` optional extra proxy-layer bearer key check
 - `LOG_LEVEL` optional log level: `debug` | `info` | `warn` | `error` (default `info`)
+- `LOG_CHAT_PAYLOAD` optional full request payload logging switch (default `false`; only enable for debugging)
+
+## Langfuse Correlation Rules
+
+- One complete task turn maps to one trace.
+- Multi-request agent/tool loops reuse the same trace by `traceparent`/`trace_id` first, then deterministic `turnId`.
+- `sessionId` is only derived from session/conversation/thread style IDs (not fallback to user ID).
+- `userId` is derived from explicit user fields and metadata sender hints.
