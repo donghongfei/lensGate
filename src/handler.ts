@@ -229,6 +229,84 @@ function buildCorrelationHints(
   };
 }
 
+function isSensitiveHeader(headerName: string): boolean {
+  return (
+    headerName === "authorization" ||
+    headerName === "proxy-authorization" ||
+    headerName === "cookie" ||
+    headerName === "set-cookie" ||
+    headerName === "x-api-key"
+  );
+}
+
+function sanitizeForLog(
+  value: unknown,
+  depth = 0,
+  limits: { maxDepth: number; maxArray: number; maxKeys: number; maxString: number } = {
+    maxDepth: 8,
+    maxArray: 200,
+    maxKeys: 200,
+    maxString: 4000
+  }
+): unknown {
+  if (value === null || value === undefined) {
+    return value ?? null;
+  }
+
+  if (depth > limits.maxDepth) {
+    return "[TRUNCATED_MAX_DEPTH]";
+  }
+
+  if (typeof value === "string") {
+    if (value.length <= limits.maxString) {
+      return value;
+    }
+    return `${value.slice(0, limits.maxString)}...[TRUNCATED_${value.length - limits.maxString}_CHARS]`;
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    const result = value.slice(0, limits.maxArray).map((item) => sanitizeForLog(item, depth + 1, limits));
+    if (value.length > limits.maxArray) {
+      result.push(`[TRUNCATED_${value.length - limits.maxArray}_ITEMS]`);
+    }
+    return result;
+  }
+
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const entries = Object.entries(record);
+    const out: Record<string, unknown> = {};
+    const maxKeys = Math.min(entries.length, limits.maxKeys);
+    for (let i = 0; i < maxKeys; i += 1) {
+      const [key, item] = entries[i];
+      out[key] = sanitizeForLog(item, depth + 1, limits);
+    }
+    if (entries.length > limits.maxKeys) {
+      out.__truncated_keys__ = entries.length - limits.maxKeys;
+    }
+    return out;
+  }
+
+  return String(value);
+}
+
+function buildRequestHeadersForLog(request: IncomingMessage): Record<string, unknown> {
+  const headers: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(request.headers)) {
+    const normalizedKey = key.toLowerCase();
+    if (isSensitiveHeader(normalizedKey)) {
+      headers[key] = "[REDACTED]";
+      continue;
+    }
+    headers[key] = sanitizeForLog(value);
+  }
+  return headers;
+}
+
 function setCorsHeaders(response: ServerResponse): void {
   response.setHeader("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN);
   response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -691,6 +769,12 @@ async function handleChatCompletions(
   writeLog("info", "chat.request.correlation_hints", {
     request_id: requestId,
     ...buildCorrelationHints(request, body, { sessionId, userId, turnId })
+  });
+
+  writeLog("info", "chat.request.payload", {
+    request_id: requestId,
+    headers: buildRequestHeadersForLog(request),
+    body: sanitizeForLog(body)
   });
 
   const modelParameters: Record<string, number> = {};
