@@ -7,7 +7,8 @@ import {
   startActiveObservation,
   startObservation,
   type LangfuseAgent,
-  type LangfuseSpan
+  type LangfuseSpan,
+  type LangfuseTool
 } from "@langfuse/tracing";
 import { getAccessToken, NotLoggedInError } from "./auth.js";
 import { BODY_LIMIT_BYTES, CORS_ALLOW_ORIGIN, LOG_CHAT_PAYLOAD, LOG_LEVEL, PROXY_API_KEY } from "./config.js";
@@ -211,8 +212,92 @@ interface ActiveAgentTurn {
   idleTimer: ReturnType<typeof setTimeout>;
 }
 
+interface PendingToolObservation {
+  observation: LangfuseTool;
+  traceId: string;
+  toolCallId: string;
+  createdAt: number;
+  lastActivityAt: number;
+  idleTimer: ReturnType<typeof setTimeout>;
+}
+
 const ACTIVE_AGENT_TURNS = new Map<string, ActiveAgentTurn>();
 const AGENT_TURN_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const PENDING_TOOL_OBSERVATIONS = new Map<string, PendingToolObservation>();
+const TOOL_OBSERVATION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
+function getPendingToolObservationKey(traceId: string, toolCallId: string): string {
+  return `${traceId}::${toolCallId}`;
+}
+
+function closePendingToolObservation(
+  pendingTool: PendingToolObservation,
+  options?: { reason?: string; level?: "WARNING" | "ERROR"; statusMessage?: string }
+): void {
+  clearTimeout(pendingTool.idleTimer);
+  PENDING_TOOL_OBSERVATIONS.delete(getPendingToolObservationKey(pendingTool.traceId, pendingTool.toolCallId));
+
+  try {
+    if (options?.level || options?.statusMessage) {
+      pendingTool.observation.update({
+        ...(options.level ? { level: options.level } : {}),
+        ...(options.statusMessage ? { statusMessage: options.statusMessage } : {})
+      });
+    }
+    pendingTool.observation.end();
+  } catch {
+    // ignore close failures during cleanup
+  }
+
+  writeLog("debug", "chat.tool_span.closed", {
+    trace_id: pendingTool.traceId,
+    tool_call_id: pendingTool.toolCallId,
+    reason: options?.reason ?? "completed",
+    duration_ms: Date.now() - pendingTool.createdAt
+  });
+}
+
+function schedulePendingToolObservationTimeout(traceId: string, toolCallId: string): void {
+  const key = getPendingToolObservationKey(traceId, toolCallId);
+  const pendingTool = PENDING_TOOL_OBSERVATIONS.get(key);
+  if (!pendingTool) {
+    return;
+  }
+
+  clearTimeout(pendingTool.idleTimer);
+  pendingTool.lastActivityAt = Date.now();
+  pendingTool.idleTimer = setTimeout(() => {
+    const current = PENDING_TOOL_OBSERVATIONS.get(key);
+    if (!current) {
+      return;
+    }
+    closePendingToolObservation(current, {
+      reason: "timeout",
+      level: "WARNING",
+      statusMessage: "Tool call timed out before receiving a tool result."
+    });
+
+    writeLog("warn", "chat.tool_span.timeout", {
+      trace_id: traceId,
+      tool_call_id: toolCallId,
+      idle_ms: Date.now() - current.lastActivityAt
+    });
+  }, TOOL_OBSERVATION_IDLE_TIMEOUT_MS);
+  pendingTool.idleTimer.unref?.();
+}
+
+function closePendingToolObservationsForTrace(traceId: string, options?: { reason?: string; level?: "WARNING" | "ERROR" }): void {
+  for (const pendingTool of PENDING_TOOL_OBSERVATIONS.values()) {
+    if (pendingTool.traceId !== traceId) {
+      continue;
+    }
+    closePendingToolObservation(pendingTool, {
+      reason: options?.reason ?? "agent_turn_closed",
+      level: options?.level ?? "WARNING",
+      statusMessage: "Tool call span closed because agent turn ended before tool result arrived."
+    });
+  }
+}
 
 function scheduleActiveAgentTurnTimeout(traceId: string): void {
   const activeAgentTurn = ACTIVE_AGENT_TURNS.get(traceId);
@@ -228,6 +313,10 @@ function scheduleActiveAgentTurnTimeout(traceId: string): void {
       return;
     }
     ACTIVE_AGENT_TURNS.delete(traceId);
+    closePendingToolObservationsForTrace(traceId, {
+      reason: "agent_turn_timeout",
+      level: "WARNING"
+    });
 
     try {
       current.observation
@@ -298,6 +387,10 @@ function closeActiveAgentTurn(
 
   ACTIVE_AGENT_TURNS.delete(traceId);
   clearTimeout(activeAgentTurn.idleTimer);
+  closePendingToolObservationsForTrace(traceId, {
+    reason: options?.reason ? `${options.reason}:agent_turn_closed` : "agent_turn_closed",
+    level: options?.level ?? "WARNING"
+  });
 
   try {
     if (options?.level || options?.statusMessage) {
@@ -812,7 +905,7 @@ interface IncomingToolResult extends NormalizedToolCall {
   output: unknown;
 }
 
-type ObservationWithChildren = Pick<LangfuseSpan, "startObservation">;
+type ObservationWithChildren = Pick<LangfuseSpan | LangfuseAgent, "startObservation">;
 
 function stringifyToolCallArguments(value: unknown): string {
   if (typeof value === "string") {
@@ -982,38 +1075,119 @@ function extractIncomingToolResults(messages: OpenAIChatRequest["messages"]): In
   return incomingToolResults;
 }
 
-function emitIncomingToolResultObservations(parent: ObservationWithChildren, incomingToolResults: IncomingToolResult[]): void {
+function emitIncomingToolResultObservations(
+  parent: ObservationWithChildren,
+  traceId: string | undefined,
+  incomingToolResults: IncomingToolResult[]
+): void {
   for (const result of incomingToolResults) {
-    parent.startObservation(
-      `tool_result.${result.name}`,
-      {
-        input: parseToolArgumentsForObservation(result.argumentsText),
-        output: result.output,
-        metadata: {
-          toolCallId: result.id,
-          phase: "runtime_result_received"
+    if (!traceId) {
+      parent.startObservation(
+        `tool_result.${result.name}`,
+        {
+          input: parseToolArgumentsForObservation(result.argumentsText),
+          output: result.output,
+          metadata: {
+            toolCallId: result.id,
+            phase: "runtime_result_received_without_trace_id"
+          },
+          statusMessage: "Tool result observed, but trace_id is missing. Cannot correlate to requested tool span."
         },
-        statusMessage: "Tool result received from runtime input messages."
+        { asType: "event" }
+      );
+      continue;
+    }
+
+    const key = getPendingToolObservationKey(traceId, result.id);
+    const pendingTool = PENDING_TOOL_OBSERVATIONS.get(key);
+    if (!pendingTool) {
+      const standaloneToolObservation = parent.startObservation(
+        `tool.${result.name}`,
+        {
+          input: parseToolArgumentsForObservation(result.argumentsText),
+          output: result.output,
+          metadata: {
+            toolCallId: result.id,
+            phase: "runtime_result_without_pending_request"
+          },
+          statusMessage: "Tool result received without matching open tool span."
+        },
+        { asType: "tool" }
+      );
+      standaloneToolObservation.end();
+      continue;
+    }
+
+    pendingTool.observation.update({
+      output: result.output,
+      metadata: {
+        toolCallId: result.id,
+        phase: "runtime_result_received"
       },
-      { asType: "event" }
-    );
+      statusMessage: "Tool call completed with runtime result."
+    });
+    closePendingToolObservation(pendingTool, { reason: "completed" });
   }
 }
 
-function emitRequestedToolCallObservations(parent: ObservationWithChildren, toolCalls: NormalizedToolCall[]): void {
+function emitRequestedToolCallObservations(
+  parent: ObservationWithChildren,
+  traceId: string | undefined,
+  toolCalls: NormalizedToolCall[]
+): void {
   for (const toolCall of toolCalls) {
-    parent.startObservation(
-      `tool_request.${toolCall.name}`,
+    if (!traceId) {
+      parent.startObservation(
+        `tool_request.${toolCall.name}`,
+        {
+          input: parseToolArgumentsForObservation(toolCall.argumentsText),
+          metadata: {
+            toolCallId: toolCall.id,
+            phase: "model_requested_without_trace_id"
+          },
+          statusMessage: "Tool call requested by model, but trace_id is missing. Cannot correlate tool lifecycle."
+        },
+        { asType: "event" }
+      );
+      continue;
+    }
+
+    const key = getPendingToolObservationKey(traceId, toolCall.id);
+    const existing = PENDING_TOOL_OBSERVATIONS.get(key);
+    if (existing) {
+      existing.observation.update({
+        metadata: {
+          toolCallId: toolCall.id,
+          phase: "model_requested_duplicate"
+        },
+        statusMessage: "Tool call request observed again before receiving a result."
+      });
+      schedulePendingToolObservationTimeout(traceId, toolCall.id);
+      continue;
+    }
+
+    const observation = parent.startObservation(
+      `tool.${toolCall.name}`,
       {
         input: parseToolArgumentsForObservation(toolCall.argumentsText),
         metadata: {
           toolCallId: toolCall.id,
           phase: "model_requested"
         },
-        statusMessage: "Tool call requested by model. Execution happens outside this proxy."
+        statusMessage: "Tool call requested by model."
       },
-      { asType: "event" }
+      { asType: "tool" }
     );
+    const pendingTool: PendingToolObservation = {
+      observation,
+      traceId,
+      toolCallId: toolCall.id,
+      createdAt: Date.now(),
+      lastActivityAt: Date.now(),
+      idleTimer: setTimeout(() => undefined, TOOL_OBSERVATION_IDLE_TIMEOUT_MS)
+    };
+    PENDING_TOOL_OBSERVATIONS.set(key, pendingTool);
+    schedulePendingToolObservationTimeout(traceId, toolCall.id);
   }
 }
 
@@ -1632,7 +1806,7 @@ async function handleChatCompletions(
 
     const incomingToolResults = extractIncomingToolResults(body.messages);
     if (incomingToolResults.length > 0) {
-      emitIncomingToolResultObservations(rootObservation, incomingToolResults);
+      emitIncomingToolResultObservations(rootObservation, traceId, incomingToolResults);
     }
 
     const generation = rootObservation.startObservation(
@@ -1660,7 +1834,7 @@ async function handleChatCompletions(
       const streamOutput = streamOutcome.streamMessage ?? streamOutcome.accumulatedText;
       const requestedToolCalls = extractToolCallsFromUnknown(streamOutcome.streamMessage);
       if (requestedToolCalls.length > 0) {
-        emitRequestedToolCallObservations(generation, requestedToolCalls);
+        emitRequestedToolCallObservations(rootObservation, traceId, requestedToolCalls);
       }
       const streamFailureMessage = streamOutcome.clientDisconnected
         ? "Client disconnected before stream completion."
@@ -1743,7 +1917,7 @@ async function handleChatCompletions(
     const responseMessage = responseBody.choices[0]?.message;
     const requestedToolCalls = extractToolCallsFromUnknown(responseMessage);
     if (requestedToolCalls.length > 0) {
-      emitRequestedToolCallObservations(generation, requestedToolCalls);
+      emitRequestedToolCallObservations(rootObservation, traceId, requestedToolCalls);
     }
     generation
       .update({
