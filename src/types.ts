@@ -58,6 +58,7 @@ export interface OpenAIChatRequest {
   model: string;
   messages: OpenAIMessage[];
   stream?: boolean;
+  stream_options?: { include_usage?: boolean };
   temperature?: number;
   max_tokens?: number;
   tools?: OpenAITool[];
@@ -119,6 +120,7 @@ export interface OpenAIChatChunk {
   model: string;
   system_fingerprint: string;
   choices: OpenAIChatChunkChoice[];
+  usage?: OpenAIUsage | null;
 }
 
 export interface OpenAIModelObject {

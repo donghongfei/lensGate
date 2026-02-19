@@ -6,7 +6,8 @@ import type {
   OpenAIContentPart,
   OpenAIMessage,
   OpenAITool,
-  OpenAIToolCall
+  OpenAIToolCall,
+  OpenAIUsage
 } from "./types.js";
 
 const SYSTEM_FINGERPRINT = "fp_lensgate";
@@ -28,6 +29,8 @@ export interface StreamState {
   emittedAnyOutput: boolean;
   accumulatedText: string;
   streamFinishReason: string | null;
+  streamUsage: OpenAIUsage | null;
+  streamMessage: unknown;
 }
 
 function asTextContent(content: string | OpenAIContentPart[] | null, allowImages: boolean): string {
@@ -268,7 +271,9 @@ export function createStreamState(modelId: string): StreamState {
     textDeltaSeen: new Set<number>(),
     emittedAnyOutput: false,
     accumulatedText: "",
-    streamFinishReason: null
+    streamFinishReason: null,
+    streamUsage: null,
+    streamMessage: null
   };
 }
 
@@ -390,11 +395,47 @@ export function eventToSSEChunks(event: unknown, state: StreamState): string[] {
   if (eventType === "done") {
     const finishReason = mapStopReason(record.reason ?? record.stopReason);
     state.streamFinishReason = finishReason;
+
+    // Capture the full done message for Langfuse output (includes tool calls)
+    if (record.message && typeof record.message === "object") {
+      state.streamMessage = record.message;
+
+      // Extract token usage from pi-ai's done event
+      const msg = record.message as Record<string, unknown>;
+      const usage = msg.usage && typeof msg.usage === "object" ? (msg.usage as Record<string, unknown>) : null;
+      if (usage) {
+        const inputTokens = safeNumber(usage.input, usage.inputTokens, usage.prompt_tokens);
+        const outputTokens = safeNumber(usage.output, usage.outputTokens, usage.completion_tokens);
+        const cacheRead = safeNumber(usage.cacheRead, usage.cacheReadTokens, usage.cached_tokens);
+        state.streamUsage = {
+          prompt_tokens: inputTokens + cacheRead,
+          completion_tokens: outputTokens,
+          total_tokens: safeNumber(usage.totalTokens, usage.total_tokens) || inputTokens + cacheRead + outputTokens,
+          completion_tokens_details: { reasoning_tokens: 0, audio_tokens: 0, accepted_prediction_tokens: 0, rejected_prediction_tokens: 0 },
+          prompt_tokens_details: { cached_tokens: cacheRead, audio_tokens: 0 }
+        };
+      }
+    }
+
     chunks.push(formatSSEDataLine(toChunk(state, {}, finishReason)));
     return chunks;
   }
 
   return chunks;
+}
+
+export function formatUsageSSEChunk(state: StreamState): string | null {
+  if (!state.streamUsage) return null;
+  const chunk = {
+    id: state.completionId,
+    object: "chat.completion.chunk",
+    created: state.created,
+    model: state.model,
+    system_fingerprint: SYSTEM_FINGERPRINT,
+    choices: [],
+    usage: state.streamUsage
+  };
+  return formatSSEDataLine(chunk);
 }
 
 function safeNumber(...values: unknown[]): number {

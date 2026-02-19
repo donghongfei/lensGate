@@ -8,6 +8,7 @@ import {
   assistantMessageToResponse,
   createStreamState,
   eventToSSEChunks,
+  formatUsageSSEChunk,
   generateCompletionId,
   ImageNotSupportedError,
   openAIRequestToContext
@@ -265,8 +266,9 @@ async function writeSSEStream(
   response: ServerResponse,
   streamLike: unknown,
   modelId: string,
-  requestId: string
-): Promise<{ emittedAnyOutput: boolean; accumulatedText: string; streamFinishReason: string | null }> {
+  requestId: string,
+  includeUsage: boolean
+): Promise<{ emittedAnyOutput: boolean; accumulatedText: string; streamFinishReason: string | null; streamMessage: unknown }> {
   response.statusCode = 200;
   setCorsHeaders(response);
   response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -301,13 +303,19 @@ async function writeSSEStream(
     });
   } finally {
     if (!closed && !response.writableEnded) {
+      if (includeUsage) {
+        const usageChunk = formatUsageSSEChunk(state);
+        if (usageChunk) {
+          response.write(usageChunk);
+        }
+      }
       response.write("data: [DONE]\n\n");
       response.end();
       closed = true;
     }
   }
 
-  return { emittedAnyOutput: state.emittedAnyOutput, accumulatedText: state.accumulatedText, streamFinishReason: state.streamFinishReason };
+  return { emittedAnyOutput: state.emittedAnyOutput, accumulatedText: state.accumulatedText, streamFinishReason: state.streamFinishReason, streamMessage: state.streamMessage };
 }
 
 function toOpenAIModelObject(model: unknown): OpenAIModelObject {
@@ -545,15 +553,6 @@ async function handleChatCompletions(
   if (typeof body.max_tokens === "number") {
     streamOptions.maxTokens = body.max_tokens;
   }
-  if (typeof body.top_p === "number") {
-    streamOptions.topP = body.top_p;
-  }
-  if (typeof body.frequency_penalty === "number") {
-    streamOptions.frequencyPenalty = body.frequency_penalty;
-  }
-  if (typeof body.presence_penalty === "number") {
-    streamOptions.presencePenalty = body.presence_penalty;
-  }
 
   writeLog("info", "chat.request.start", {
     request_id: requestId,
@@ -587,12 +586,13 @@ async function handleChatCompletions(
     const eventStream = streamSimple(model as never, context as never, streamOptions as never);
 
     if (body.stream === true) {
-      const streamOutcome = await writeSSEStream(response, eventStream, requestedModelId, requestId);
+      const streamOutcome = await writeSSEStream(response, eventStream, requestedModelId, requestId, body.stream_options?.include_usage === true);
+      const streamOutput = streamOutcome.accumulatedText || streamOutcome.streamMessage;
       generation.update({
-        output: streamOutcome.accumulatedText,
+        output: streamOutput,
         ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {})
       }).end();
-      trace.update({ output: streamOutcome.accumulatedText });
+      trace.update({ output: streamOutput });
       writeLog("info", "chat.request.complete", {
         request_id: requestId,
         model: requestedModelId,
