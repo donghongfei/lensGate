@@ -1390,7 +1390,7 @@ async function handleChatCompletions(
         tags: toolContext.isAgentic
           ? ["openai-proxy", "chat.completions", "agentic"]
           : ["openai-proxy", "chat.completions"],
-        input: { messages: body.messages },
+        input: body.messages,
         metadata: {
           model: body.model,
           stream: body.stream === true,
@@ -1455,6 +1455,7 @@ async function handleChatCompletions(
           .end();
 
         rootObservation.update({ output: streamOutput });
+        rootObservation.updateTrace({ output: streamOutput });
         writeLog("info", "chat.request.complete", {
           request_id: requestId,
           model: requestedModelId,
@@ -1502,6 +1503,7 @@ async function handleChatCompletions(
         .end();
 
       rootObservation.update({ output: responseMessage });
+      rootObservation.updateTrace({ output: responseMessage });
 
       writeLog("info", "chat.request.complete", {
         request_id: requestId,
