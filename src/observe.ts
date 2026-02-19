@@ -56,7 +56,7 @@ export function startGeneration(params: GenerationParams): LangfuseGenerationCli
   return trace.generation({
     name: "chat_completion",
     model: params.model,
-    input: params.messages,
+    input: { messages: params.messages },
     modelParameters,
     startTime: new Date(params.startedAt)
   });
@@ -72,9 +72,9 @@ export function endGeneration(generation: LangfuseGenerationClient | null, outpu
     ...(hasUsage
       ? {
           usage: {
-            promptTokens: output.promptTokens,
-            completionTokens: output.completionTokens,
-            totalTokens: output.totalTokens ?? (output.promptTokens ?? 0) + (output.completionTokens ?? 0)
+            input: output.promptTokens,
+            output: output.completionTokens,
+            total: output.totalTokens ?? (output.promptTokens ?? 0) + (output.completionTokens ?? 0)
           }
         }
       : {}),
