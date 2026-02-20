@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import { BlockList, isIP } from "node:net";
 import type {
   OpenAIChatChunk,
@@ -10,10 +11,13 @@ import type {
   OpenAIToolCall,
   OpenAIUsage
 } from "./types.js";
+import { parseToolArgumentsInput } from "./tool-args.js";
+import { extractNormalizedToolCalls } from "./tool-calls.js";
 
 const SYSTEM_FINGERPRINT = "fp_lensgate";
 const MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 20_000;
+const MAX_IMAGE_REDIRECTS = 5;
 const PRIVATE_ADDRESS_BLOCKLIST = new BlockList();
 PRIVATE_ADDRESS_BLOCKLIST.addSubnet("0.0.0.0", 8, "ipv4");
 PRIVATE_ADDRESS_BLOCKLIST.addSubnet("10.0.0.0", 8, "ipv4");
@@ -110,6 +114,48 @@ function isBlockedImageHostname(hostname: string): boolean {
   return false;
 }
 
+function isAllowedImagePort(url: URL): boolean {
+  if (!url.port) {
+    return true;
+  }
+  return (url.protocol === "http:" && url.port === "80") || (url.protocol === "https:" && url.port === "443");
+}
+
+async function assertImageUrlIsPublic(url: URL): Promise<void> {
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new ImageNotSupportedError("Only http(s) and data URI image_url values are supported.");
+  }
+  if (!isAllowedImagePort(url)) {
+    throw new ImageNotSupportedError("image_url port is not allowed.");
+  }
+  if (isBlockedImageHostname(url.hostname)) {
+    throw new ImageNotSupportedError("image_url host is not allowed.");
+  }
+
+  if (isIP(url.hostname) !== 0) {
+    return;
+  }
+
+  let addresses: Array<{ address: string; family: number }>;
+  try {
+    addresses = await lookup(url.hostname, { all: true, verbatim: true });
+  } catch {
+    throw new ImageNotSupportedError(`Failed to resolve image_url host '${url.hostname}'.`);
+  }
+  if (addresses.length === 0) {
+    throw new ImageNotSupportedError(`image_url host '${url.hostname}' resolved to no addresses.`);
+  }
+  for (const address of addresses) {
+    if (isBlockedImageHostname(address.address)) {
+      throw new ImageNotSupportedError("image_url host is not allowed.");
+    }
+  }
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
 function parseDataUrl(dataUrl: string): { mimeType: string; data: string } {
   const commaIndex = dataUrl.indexOf(",");
   if (commaIndex < 0) {
@@ -177,28 +223,51 @@ async function fetchRemoteImageAsBase64(url: URL): Promise<{ mimeType: string; d
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_TIMEOUT_MS);
   try {
-    const response = await fetch(url, {
-      method: "GET",
-      redirect: "follow",
-      signal: controller.signal
-    });
-    if (!response.ok) {
-      throw new ImageNotSupportedError(`Failed to fetch image_url. HTTP ${response.status}.`);
-    }
+    let currentUrl = new URL(url.toString());
+    for (let redirectCount = 0; redirectCount <= MAX_IMAGE_REDIRECTS; redirectCount += 1) {
+      await assertImageUrlIsPublic(currentUrl);
+      const response = await fetch(currentUrl, {
+        method: "GET",
+        redirect: "manual",
+        signal: controller.signal
+      });
 
-    const contentTypeHeader = response.headers.get("content-type");
-    const headerMimeType = contentTypeHeader?.split(";")[0]?.trim().toLowerCase() ?? "";
-    const mimeType = isImageMimeType(headerMimeType) ? headerMimeType : inferMimeTypeFromUrl(url);
-    if (!mimeType) {
-      throw new ImageNotSupportedError("Could not determine image_url media type.");
-    }
+      if (isRedirectStatus(response.status)) {
+        const location = response.headers.get("location");
+        if (!location) {
+          throw new ImageNotSupportedError("image_url redirect response is missing location.");
+        }
+        if (redirectCount === MAX_IMAGE_REDIRECTS) {
+          throw new ImageNotSupportedError("image_url exceeded redirect limit.");
+        }
+        currentUrl = new URL(location, currentUrl);
+        continue;
+      }
 
-    const bytes = await readResponseBodyLimited(response, MAX_REMOTE_IMAGE_BYTES);
-    if (bytes.length === 0) {
-      throw new ImageNotSupportedError("image_url resolved to an empty body.");
-    }
+      if (!response.ok) {
+        throw new ImageNotSupportedError(`Failed to fetch image_url. HTTP ${response.status}.`);
+      }
 
-    return { mimeType, data: bytes.toString("base64") };
+      const declaredContentLength = Number.parseInt(response.headers.get("content-length") ?? "", 10);
+      if (Number.isFinite(declaredContentLength) && declaredContentLength > MAX_REMOTE_IMAGE_BYTES) {
+        throw new ImageNotSupportedError(`Remote image exceeds ${MAX_REMOTE_IMAGE_BYTES} bytes.`);
+      }
+
+      const contentTypeHeader = response.headers.get("content-type");
+      const headerMimeType = contentTypeHeader?.split(";")[0]?.trim().toLowerCase() ?? "";
+      const mimeType = isImageMimeType(headerMimeType) ? headerMimeType : inferMimeTypeFromUrl(currentUrl);
+      if (!mimeType) {
+        throw new ImageNotSupportedError("Could not determine image_url media type.");
+      }
+
+      const bytes = await readResponseBodyLimited(response, MAX_REMOTE_IMAGE_BYTES);
+      if (bytes.length === 0) {
+        throw new ImageNotSupportedError("image_url resolved to an empty body.");
+      }
+
+      return { mimeType, data: bytes.toString("base64") };
+    }
+    throw new ImageNotSupportedError("image_url exceeded redirect limit.");
   } catch (error) {
     if (error instanceof ImageNotSupportedError) {
       throw error;
@@ -230,6 +299,9 @@ async function toPiImageContent(urlValue: string): Promise<{ type: "image"; data
 
   if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
     throw new ImageNotSupportedError("Only http(s) and data URI image_url values are supported.");
+  }
+  if (!isAllowedImagePort(parsedUrl)) {
+    throw new ImageNotSupportedError("image_url port is not allowed.");
   }
   if (isBlockedImageHostname(parsedUrl.hostname)) {
     throw new ImageNotSupportedError("image_url host is not allowed.");
@@ -271,20 +343,6 @@ async function userContentToPiContent(
   }
 
   return parts;
-}
-
-function parseToolArguments(argumentsText: string): unknown {
-  const input = argumentsText.trim();
-  if (!input) {
-    return {};
-  }
-  try {
-    return JSON.parse(input);
-  } catch {
-    return {
-      raw: argumentsText
-    };
-  }
 }
 
 function messageToTool(message: OpenAITool): Record<string, unknown> {
@@ -335,7 +393,7 @@ async function messageRoleToPiMessage(message: OpenAIMessage): Promise<Record<st
           type: "toolCall",
           id: toolCall.id,
           name: toolCall.function.name,
-          arguments: parseToolArguments(toolCall.function.arguments)
+          arguments: parseToolArgumentsInput(toolCall.function.arguments)
         });
       }
     }
@@ -743,50 +801,20 @@ function assistantTextFromMessage(message: Record<string, unknown>): string {
 }
 
 function openAiToolCallsFromMessage(message: Record<string, unknown>): OpenAIToolCall[] {
-  const structuredCalls =
-    (Array.isArray(message.toolCalls) ? message.toolCalls : null) ??
-    (Array.isArray(message.tool_calls) ? message.tool_calls : null) ??
-    [];
-  const contentCalls =
-    Array.isArray(message.content)
-      ? message.content.filter(
-          (item): item is Record<string, unknown> =>
-            Boolean(item) && typeof item === "object" && (item as Record<string, unknown>).type === "toolCall"
-        )
-      : [];
-  const source = structuredCalls.length > 0 ? structuredCalls : contentCalls;
-
-  const calls: OpenAIToolCall[] = [];
-  for (let i = 0; i < source.length; i += 1) {
-    const item = source[i];
-    if (!item || typeof item !== "object") {
-      continue;
+  const extracted = extractNormalizedToolCalls(message, {
+    stringifyArguments: stringifyToolArguments,
+    defaultName: "tool",
+    fallbackId: (index) => `call_${index}`,
+    fallbackArgumentsValue: {}
+  });
+  return extracted.map((toolCall) => ({
+    id: toolCall.id,
+    type: "function",
+    function: {
+      name: toolCall.name,
+      arguments: toolCall.argumentsText
     }
-    const record = item as Record<string, unknown>;
-    const functionRecord =
-      record.function && typeof record.function === "object"
-        ? (record.function as Record<string, unknown>)
-        : undefined;
-
-    const name =
-      (typeof record.name === "string" && record.name) ||
-      (typeof record.toolName === "string" && record.toolName) ||
-      ((functionRecord && typeof functionRecord.name === "string" ? functionRecord.name : "") || "tool");
-
-    calls.push({
-      id:
-        (typeof record.id === "string" && record.id) ||
-        (typeof record.toolCallId === "string" && record.toolCallId) ||
-        `call_${i}`,
-      type: "function",
-      function: {
-        name,
-        arguments: stringifyToolArguments(record.arguments ?? functionRecord?.arguments ?? record.input ?? {})
-      }
-    });
-  }
-
-  return calls;
+  }));
 }
 
 export function assistantMessageToResponse(

@@ -29,6 +29,8 @@ import type {
   OpenAIModelsResponse,
   OpenAIUsage
 } from "./types.js";
+import { parseToolArgumentsInput } from "./tool-args.js";
+import { extractNormalizedToolCalls } from "./tool-calls.js";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -922,69 +924,19 @@ function stringifyToolCallArguments(value: unknown): string {
 }
 
 function extractToolCallsFromUnknown(message: unknown): NormalizedToolCall[] {
-  if (!message || typeof message !== "object") {
-    return [];
-  }
-
-  const record = message as Record<string, unknown>;
-  const structuredCalls =
-    (Array.isArray(record.toolCalls) ? record.toolCalls : null) ??
-    (Array.isArray(record.tool_calls) ? record.tool_calls : null) ??
-    [];
-  const contentCalls = Array.isArray(record.content)
-    ? record.content.filter(
-        (item): item is Record<string, unknown> =>
-          Boolean(item) && typeof item === "object" && (item as Record<string, unknown>).type === "toolCall"
-      )
-    : [];
-  const source = structuredCalls.length > 0 ? structuredCalls : contentCalls;
-
-  const calls: NormalizedToolCall[] = [];
-  for (let i = 0; i < source.length; i += 1) {
-    const item = source[i];
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-    const itemRecord = item as Record<string, unknown>;
-    const functionRecord =
-      itemRecord.function && typeof itemRecord.function === "object"
-        ? (itemRecord.function as Record<string, unknown>)
-        : undefined;
-
-    const id =
-      normalizeId(itemRecord.id, 200) ??
-      normalizeId(itemRecord.toolCallId, 200) ??
-      normalizeId(functionRecord?.id, 200) ??
-      `call_${i}`;
-    const name =
-      normalizeId(itemRecord.name, 200) ??
-      normalizeId(itemRecord.toolName, 200) ??
-      normalizeId(functionRecord?.name, 200) ??
-      "tool";
-    const argumentsText = stringifyToolCallArguments(
-      itemRecord.arguments ?? functionRecord?.arguments ?? itemRecord.input ?? ""
-    );
-
-    calls.push({
-      id,
-      name,
-      argumentsText
-    });
-  }
-
-  return calls;
+  return extractNormalizedToolCalls(message, {
+    normalizeId: (value) => normalizeId(value, 200),
+    normalizeName: (value) => normalizeId(value, 200),
+    stringifyArguments: stringifyToolCallArguments,
+    includeFunctionId: true,
+    defaultName: "tool",
+    fallbackId: (index) => `call_${index}`,
+    fallbackArgumentsValue: ""
+  });
 }
 
 function parseToolArgumentsForObservation(argumentsText: string): unknown {
-  const input = argumentsText.trim();
-  if (!input) {
-    return {};
-  }
-  try {
-    return JSON.parse(input);
-  } catch {
-    return { raw: argumentsText };
-  }
+  return parseToolArgumentsInput(argumentsText);
 }
 
 function toolMessageContentToObservationOutput(
@@ -1408,11 +1360,14 @@ async function writeSSEStream(
 
   try {
     for await (const event of asAsyncIterable(streamLike)) {
-      if (clientDisconnected) {
+      if (clientDisconnected || response.destroyed || response.writableEnded) {
         break;
       }
       const chunks = eventToSSEChunks(event, state);
       for (const chunk of chunks) {
+        if (clientDisconnected || response.destroyed || response.writableEnded) {
+          break;
+        }
         response.write(chunk);
       }
     }
@@ -1424,14 +1379,17 @@ async function writeSSEStream(
       model: modelId,
       message: iterationErrorMessage
     });
-    if (!clientDisconnected && !response.writableEnded) {
+    if (!clientDisconnected && !response.destroyed && !response.writableEnded) {
       const errorChunks = eventToSSEChunks({ type: "error", message: iterationErrorMessage }, state);
       for (const chunk of errorChunks) {
+        if (response.destroyed || response.writableEnded) {
+          break;
+        }
         response.write(chunk);
       }
     }
   } finally {
-    if (!closed && !response.writableEnded) {
+    if (!closed && !clientDisconnected && !response.destroyed && !response.writableEnded) {
       if (includeUsage) {
         const usageChunk = formatUsageSSEChunk(state);
         if (usageChunk) {
@@ -1818,31 +1776,42 @@ async function handleChatCompletions(
       },
       { asType: "generation" }
     );
-
-    const eventStream = streamSimple(model as never, context as never, streamOptions as never);
-
-    if (body.stream === true) {
-      const streamOutcome = await writeSSEStream(
-        response,
-        eventStream,
-        requestedModelId,
-        requestId,
-        body.stream_options?.include_usage === true,
-        upstreamAbortController
-      );
-      // Prefer structured stream message to preserve tool-call payloads for tracing.
-      const streamOutput = streamOutcome.streamMessage ?? streamOutcome.accumulatedText;
-      const requestedToolCalls = extractToolCallsFromUnknown(streamOutcome.streamMessage);
-      if (requestedToolCalls.length > 0) {
-        emitRequestedToolCallObservations(rootObservation, traceId, requestedToolCalls);
+    let generationClosed = false;
+    const closeGeneration = (update?: Parameters<typeof generation.update>[0]): void => {
+      if (generationClosed) {
+        return;
       }
-      const streamFailureMessage = streamOutcome.clientDisconnected
-        ? "Client disconnected before stream completion."
-        : streamOutcome.iterationErrorMessage
-          ? `Streaming interrupted: ${streamOutcome.iterationErrorMessage}`
-          : null;
-      generation
-        .update({
+      if (update) {
+        generation.update(update);
+      }
+      generation.end();
+      generationClosed = true;
+    };
+
+    try {
+      const eventStream = streamSimple(model as never, context as never, streamOptions as never);
+
+      if (body.stream === true) {
+        const streamOutcome = await writeSSEStream(
+          response,
+          eventStream,
+          requestedModelId,
+          requestId,
+          body.stream_options?.include_usage === true,
+          upstreamAbortController
+        );
+        // Prefer structured stream message to preserve tool-call payloads for tracing.
+        const streamOutput = streamOutcome.streamMessage ?? streamOutcome.accumulatedText;
+        const requestedToolCalls = extractToolCallsFromUnknown(streamOutcome.streamMessage);
+        if (requestedToolCalls.length > 0) {
+          emitRequestedToolCallObservations(rootObservation, traceId, requestedToolCalls);
+        }
+        const streamFailureMessage = streamOutcome.clientDisconnected
+          ? "Client disconnected before stream completion."
+          : streamOutcome.iterationErrorMessage
+            ? `Streaming interrupted: ${streamOutcome.iterationErrorMessage}`
+            : null;
+        closeGeneration({
           output: streamOutput,
           ...(streamOutcome.streamUsage
             ? {
@@ -1855,72 +1824,70 @@ async function handleChatCompletions(
             : {}),
           ...(streamOutcome.streamFinishReason ? { metadata: { finishReason: streamOutcome.streamFinishReason } } : {}),
           ...(streamFailureMessage ? { level: "ERROR", statusMessage: streamFailureMessage } : {})
-        })
-        .end();
-
-      if (streamFailureMessage) {
-        rootObservation.update({
-          output: streamOutput,
-          level: "ERROR",
-          statusMessage: streamFailureMessage
         });
-      } else {
-        rootObservation.update({ output: streamOutput });
+
+        if (streamFailureMessage) {
+          rootObservation.update({
+            output: streamOutput,
+            level: "ERROR",
+            statusMessage: streamFailureMessage
+          });
+        } else {
+          rootObservation.update({ output: streamOutput });
+        }
+        if (!streamFailureMessage && streamOutcome.streamFinishReason !== "tool_calls") {
+          rootObservation.updateTrace({ output: streamOutput });
+        }
+        if (streamFailureMessage) {
+          writeLog("warn", "chat.request.stream_incomplete", {
+            request_id: requestId,
+            model: requestedModelId,
+            stream: true,
+            status_code: response.statusCode,
+            duration_ms: Date.now() - startedAt,
+            emitted_output: streamOutcome.emittedAnyOutput,
+            tool_calls_requested: requestedToolCalls.length,
+            message: streamFailureMessage
+          });
+        } else {
+          writeLog("info", "chat.request.complete", {
+            request_id: requestId,
+            model: requestedModelId,
+            stream: true,
+            status_code: response.statusCode,
+            duration_ms: Date.now() - startedAt,
+            emitted_output: streamOutcome.emittedAnyOutput,
+            tool_calls_requested: requestedToolCalls.length
+          });
+        }
+
+        return {
+          endAgentTurn: streamFailureMessage !== null || streamOutcome.streamFinishReason !== "tool_calls"
+        };
       }
-      if (!streamFailureMessage && streamOutcome.streamFinishReason !== "tool_calls") {
-        rootObservation.updateTrace({ output: streamOutput });
-      }
-      if (streamFailureMessage) {
-        writeLog("warn", "chat.request.stream_incomplete", {
-          request_id: requestId,
-          model: requestedModelId,
-          stream: true,
-          status_code: response.statusCode,
-          duration_ms: Date.now() - startedAt,
-          emitted_output: streamOutcome.emittedAnyOutput,
-          tool_calls_requested: requestedToolCalls.length,
-          message: streamFailureMessage
-        });
-      } else {
-        writeLog("info", "chat.request.complete", {
-          request_id: requestId,
-          model: requestedModelId,
-          stream: true,
-          status_code: response.statusCode,
-          duration_ms: Date.now() - startedAt,
-          emitted_output: streamOutcome.emittedAnyOutput,
-          tool_calls_requested: requestedToolCalls.length
-        });
+
+      const assistantMessage = await getFinalAssistantMessage(eventStream);
+      if (!assistantMessage) {
+        closeGeneration({ level: "ERROR", statusMessage: "No final assistant message returned." });
+        throw new Error("No final assistant message returned from upstream stream.");
       }
 
-      return {
-        endAgentTurn: streamFailureMessage !== null || streamOutcome.streamFinishReason !== "tool_calls"
-      };
-    }
+      const stopReason = getAssistantStopReason(assistantMessage);
+      if (stopReason === "error" || stopReason === "aborted") {
+        const message = getAssistantErrorMessage(assistantMessage) || `Upstream request failed with stop reason '${stopReason}'.`;
+        closeGeneration({ level: "ERROR", statusMessage: message });
+        throw new UpstreamModelError(message);
+      }
 
-    const assistantMessage = await getFinalAssistantMessage(eventStream);
-    if (!assistantMessage) {
-      generation.update({ level: "ERROR", statusMessage: "No final assistant message returned." }).end();
-      throw new Error("No final assistant message returned from upstream stream.");
-    }
+      const responseBody = assistantMessageToResponse(assistantMessage, requestedModelId, generateCompletionId());
+      sendJson(response, 200, responseBody);
 
-    const stopReason = getAssistantStopReason(assistantMessage);
-    if (stopReason === "error" || stopReason === "aborted") {
-      const message = getAssistantErrorMessage(assistantMessage) || `Upstream request failed with stop reason '${stopReason}'.`;
-      generation.update({ level: "ERROR", statusMessage: message }).end();
-      throw new UpstreamModelError(message);
-    }
-
-    const responseBody = assistantMessageToResponse(assistantMessage, requestedModelId, generateCompletionId());
-    sendJson(response, 200, responseBody);
-
-    const responseMessage = responseBody.choices[0]?.message;
-    const requestedToolCalls = extractToolCallsFromUnknown(responseMessage);
-    if (requestedToolCalls.length > 0) {
-      emitRequestedToolCallObservations(rootObservation, traceId, requestedToolCalls);
-    }
-    generation
-      .update({
+      const responseMessage = responseBody.choices[0]?.message;
+      const requestedToolCalls = extractToolCallsFromUnknown(responseMessage);
+      if (requestedToolCalls.length > 0) {
+        emitRequestedToolCallObservations(rootObservation, traceId, requestedToolCalls);
+      }
+      closeGeneration({
         output: responseMessage,
         usageDetails: {
           input: responseBody.usage.prompt_tokens,
@@ -1928,29 +1895,35 @@ async function handleChatCompletions(
           total: responseBody.usage.total_tokens
         },
         ...(responseBody.choices[0]?.finish_reason ? { metadata: { finishReason: responseBody.choices[0].finish_reason } } : {})
-      })
-      .end();
+      });
 
-    rootObservation.update({ output: responseMessage });
-    if (responseBody.choices[0]?.finish_reason !== "tool_calls") {
-      rootObservation.updateTrace({ output: responseMessage });
+      rootObservation.update({ output: responseMessage });
+      if (responseBody.choices[0]?.finish_reason !== "tool_calls") {
+        rootObservation.updateTrace({ output: responseMessage });
+      }
+
+      writeLog("info", "chat.request.complete", {
+        request_id: requestId,
+        model: requestedModelId,
+        stream: false,
+        status_code: 200,
+        duration_ms: Date.now() - startedAt,
+        finish_reason: responseBody.choices[0]?.finish_reason ?? null,
+        prompt_tokens: responseBody.usage.prompt_tokens,
+        completion_tokens: responseBody.usage.completion_tokens,
+        tool_calls_requested: requestedToolCalls.length
+      });
+
+      return {
+        endAgentTurn: responseBody.choices[0]?.finish_reason !== "tool_calls"
+      };
+    } catch (error) {
+      closeGeneration({
+        level: "ERROR",
+        statusMessage: getErrorMessage(error)
+      });
+      throw error;
     }
-
-    writeLog("info", "chat.request.complete", {
-      request_id: requestId,
-      model: requestedModelId,
-      stream: false,
-      status_code: 200,
-      duration_ms: Date.now() - startedAt,
-      finish_reason: responseBody.choices[0]?.finish_reason ?? null,
-      prompt_tokens: responseBody.usage.prompt_tokens,
-      completion_tokens: responseBody.usage.completion_tokens,
-      tool_calls_requested: requestedToolCalls.length
-    });
-
-    return {
-      endAgentTurn: responseBody.choices[0]?.finish_reason !== "tool_calls"
-    };
   };
 
   const startTime = new Date(startedAt);
