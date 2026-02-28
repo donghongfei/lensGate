@@ -25,6 +25,17 @@ pnpm run login
 pnpm run start
 ```
 
+重启命令：
+```
+git pull && pnpm run build && sudo systemctl restart lensgate
+```
+
+查看日志：
+```
+sudo journalctl -u lensgate -f
+```
+
+
 Default server address:
 
 - `http://127.0.0.1:3000`
